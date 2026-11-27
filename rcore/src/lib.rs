@@ -58,3 +58,4 @@ pub mod sizing;
 pub mod pipeline;
 pub mod quality;
 pub mod report;
+pub mod foldfree;
