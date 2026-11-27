@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    name: rcore build + tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rcore
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rcore
+      - name: Build (warnings are errors)
+        run: RUSTFLAGS="-D warnings" cargo build --release
+      - name: Test
+        run: RUSTFLAGS="-D warnings" cargo test --release

@@ -1,0 +1,13 @@
+# generated meshes, solver output, benchmarks (large; reproducible from the scripts)
+proto2d/runs/
+rcore/target/
+__pycache__/
+*.pyc
+*.su2
+*.vtk
+*.vtu
+processor*/
+
+# private working notes (not part of the public repo)
+handover.md
+mesh_handover.md

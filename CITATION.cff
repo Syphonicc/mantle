@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: "If you use mantle in your work, please cite it as below."
+title: "mantle: shell-first hybrid meshing for CFD"
+type: software
+authors:
+  - alias: Syphonicc
+repository-code: "https://github.com/Syphonicc/mantle"
+license: Apache-2.0
+keywords:
+  - mesh generation
+  - CFD
+  - boundary layer
+  - OpenFOAM
+  - SU2

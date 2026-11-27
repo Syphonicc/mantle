@@ -1,0 +1,13 @@
+[package]
+name = "rcore"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Compiled core of mantle, a shell-first hybrid mesher for CFD"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
