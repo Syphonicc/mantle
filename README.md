@@ -1,16 +1,68 @@
-# mantle
+<div align="center">
 
-**Shell-first hybrid meshing for CFD: wrap the body in its boundary-layer shell first, then mesh everything else.**
+<img src="docs/figures/banner.png" alt="mantle: shell-first hybrid meshing for CFD" width="100%">
 
-mantle is an open-source mesh generator for viscous CFD (OpenFOAM and SU2). The goal is to match what established meshers already do, and also to handle cases where they fail or give up:
+**Wrap the body in its boundary-layer shell first, then mesh everything else.**
+
+[![CI](https://github.com/Syphonicc/mantle/actions/workflows/ci.yml/badge.svg)](https://github.com/Syphonicc/mantle/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/core-Rust%20(std%20only)-b7410e.svg)](rcore/)
+[![OpenFOAM](https://img.shields.io/badge/OpenFOAM-polyMesh-2f6db5.svg)](https://www.openfoam.com/)
+[![SU2](https://img.shields.io/badge/SU2-native%20.su2-e0562c.svg)](https://su2code.github.io/)
+[![Status](https://img.shields.io/badge/status-research%20prototype-orange.svg)](#limitations)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+
+[Quick start](#quick-start) · [How it works](#how-it-works) · [Results](#measured-results-2d-prototype) · [3D status](#3d-status-rust-core-rcore) · [Roadmap](#roadmap) · [Contributing](CONTRIBUTING.md)
+
+</div>
+
+---
+
+mantle is an open-source mesh generator for viscous CFD. It reads an STL and writes an **OpenFOAM** case and a native **SU2** mesh. The goal is to match what established meshers already do, and also to handle cases where they fail or give up:
 
 - y+ ≈ 1 boundary layers that do not collapse;
 - layers that survive sharp edges, narrow gaps and dirty geometry;
 - one mesh that runs in both OpenFOAM and SU2.
 
-> **Status: research prototype.** The 2D method is validated against snappyHexMesh, Gmsh and NASA reference data (numbers below). The 3D core (Rust) builds valid wall-resolved meshes on smooth and sharp-edged bodies, but does **not** yet handle concave junctions (see [Limitations](#limitations)). Not production-ready.
+> **Status: research prototype.** The 2D method is validated against snappyHexMesh, Gmsh and NASA reference data. The 3D core builds valid wall-resolved meshes on smooth and sharp-edged bodies; sharp concave junctions are still being worked on (see [Limitations](#limitations)). Not production-ready yet: bug reports and test geometries are very welcome.
 
----
+## Highlights
+
+- 🧱 **100 % of first cells on spec at y+ ≈ 1** in 2D, where snappyHexMesh with default settings collapses every layer ([details](#y-1-against-snappyhexmesh)).
+- 🎯 **Closer to NASA reference data than Gmsh** at equal refinement on the NACA 0012 (Cl/Cd, [details](#against-gmsh)).
+- 🧩 **Dirty STL in**: inside/outside from fast winding numbers; holes, folds and overlapping parts are handled or reported, never silently meshed through.
+- 🔀 **One mesh, two solvers**: native OpenFOAM polyMesh and native SU2, both checked with `checkMesh` and `SU2_CFD`.
+- ⚡ **Rust core with zero dependencies**: tri-dexel inside/outside of 16.8M points in 0.26 s.
+
+## Quick start
+
+```bash
+git clone https://github.com/Syphonicc/mantle.git && cd mantle
+cd rcore && cargo build --release && cd ..
+
+# mesh the example sphere: STL in, OpenFOAM case + SU2 mesh out
+rcore/target/release/mantle examples/sphere.stl -o sphere_case
+
+# wall-resolved: first cell from a target y+ and Reynolds number
+rcore/target/release/mantle examples/sphere.stl -o sphere_y1 --yplus 1 --re 1e6
+
+checkMesh -case sphere_case          # OpenFOAM
+# SU2: MESH_FILENAME= sphere_case/mesh.su2  (markers: wall, farfield)
+```
+
+On an 8-core laptop CPU (Ryzen 7 4800H) the example sphere meshes in about 7 s (306k cells) and the box in about 3 s (222k cells); both pass OpenFOAM's default `checkMesh` ("Mesh OK") and load in SU2 without re-oriented elements. The wall-resolved sphere (`--yplus 1 --re 1e6`, 26+ layers) meshes in about 9 s.
+
+Every run also writes **`mantle_report.md`**: input checks (holes, flipped triangles, overlapping parts, features that the chosen sizing cannot resolve), checkMesh-equivalent quality metrics computed by mantle itself, and a list of localised issues with likely cause and suggested fix. Problem cells are written as the OpenFOAM cellSet `mantleBadCells` for viewing in ParaView. `mantle input.stl --report-only` checks a geometry without meshing it.
+
+`mantle --help` lists all options (presets, layer count, growth, first cell height, far-field size). Sizing is automatic by default, including thin bodies such as wings. See [examples/](examples/README.md); `examples/oneram6_full.stl` is the ONERA M6 wing (mirrored to full span from the SU2 test case).
+
+## Gallery
+
+| 3D cut-away: sphere | 3D cut-away: cube |
+|---|---|
+| ![](docs/figures/3d_sphere_cutaway.png) | ![](docs/figures/3d_cube_cutaway.png) |
+| **Layers → pillow → octree core** (slice, coloured by log cell volume) | **Layer fan at a sharp edge** (slice through a cube corner) |
+| ![](docs/figures/3d_sphere_layers.png) | ![](docs/figures/3d_cube_edge_fan.png) |
 
 ## Why another mesher?
 
@@ -30,7 +82,7 @@ The layers are never pushed into an existing mesh, so there is nothing for them 
 
 | Capability | Typical behaviour of existing tools | mantle (status) |
 |---|---|---|
-| y+ ≈ 1 layers that don't collapse | snappyHexMesh: **0 % layers** at y+ ≈ 1 with default quality settings in our test; relaxed settings gave an invalid mesh at the next refinement level | 100 % of first cells on spec, every level (2D ✅; 3D ✅ smooth and sharp-edged bodies, ❌ concave junctions) |
+| y+ ≈ 1 layers that don't collapse | snappyHexMesh: **0 % layers** at y+ ≈ 1 with default quality settings in our test; relaxed settings gave an invalid mesh at the next refinement level | 100 % of first cells on spec, every level (2D ✅; 3D ✅ smooth and sharp-edged bodies, ⚠️ sharp concave junctions) |
 | Layers on sharp convex edges and corners | Usually collapsed or dropped at the edge | Automatic layer **fans** (prisms/pyramids in 3D) (2D ✅, 3D ✅) |
 | Gaps narrower than the layer stack | Layers collapse or intersect | A shell safety net detects the collision and thins δ locally, so layers survive (2D ✅) |
 | Dirty geometry (holes, folds, zero-width slivers, overlapping parts) | Needs a wrapper or repair step | Inside/outside from winding numbers plus exact, **reported** repairs; leaks are detected, not silently meshed through (2D ✅; 3D inside/outside ✅) |
@@ -46,13 +98,13 @@ triangle soup (dirty STL ok)
    │  tri-dexel rays + fast generalized winding numbers ─► inside/outside, exact surface crossings
    ▼
 shell Γ = offset of the wall at δ(x)
-   │  eikonal shell (2D) / exact closest-point offset (3D); safety net: one shell per body, no wall crossing
+   │  eikonal shell (2D) / exact offset, filleted at concave creases (3D); safety net: one shell per body
    ▼
 bulk = 2:1-balanced octree (quadtree in 2D) outside the shell
    │  3D: hex core + one pillow layer projected onto the shell, Jacobian-optimised
    ▼
 layers = columns from the shell down to the wall
-   │  2D: harmonic streamlines; 3D: nearest-wall-point columns; geometric growth, per-column first cell = spec,
+   │  harmonic streamlines (2D and 3D); geometric growth, per-column first cell = spec,
    │  fans at convex features
    ▼
 OpenFOAM polyMesh  +  SU2 native mesh
@@ -124,47 +176,50 @@ Test bodies: sphere, sphere ∪ torus (intersecting, i.e. a dirty soup), and a s
 | Inside/outside of 16.8M grid nodes on a 21k-triangle dirty soup | 0.26 s CPU (tri-dexel + fast winding fallback); 0.125 s GPU; 100 % agreement with exact winding numbers |
 | Octree, 14.4M leaves, strict 2:1 balance | 24 s; 0 balance violations; exact surface crossings to 1e-16 |
 | Hex core + pillow layer on the shell | Min scaled Jacobian 0.50 / 0.37 / 0.50; 0 cells below 0.2; default `checkMesh` reports "Mesh OK"; SU2 loads clean |
-| Boundary layers (12 layers) | Sphere and cube: 0 inverted cells, first cell on spec, prism/pyramid fans at the cube edges, "Mesh OK". SA RANS smoke test in SU2 converges 1e-5 → 1e-8 in 300 iterations |
+| Boundary layers (12 layers, harmonic streamline columns, filleted shell) | Sphere and cube: 0 inverted cells, first cell on spec, prism/pyramid fans at the cube edges, "Mesh OK" in 2–4 s. Sphere ∪ torus and two intersecting boxes: 0 inverted cells, but a few flagged faces at the junction (see Limitations). SA RANS smoke test in SU2 converges 1e-5 → 1e-8 in 300 iterations |
+| `mantle` command line | STL (ASCII or binary) in → OpenFOAM case + SU2 mesh + JSON summary out, with automatic sizing and first cell from target y+ |
 
 ### Limitations
 
-- **Concave junctions are not handled yet.** Where two bodies meet (the sphere ∪ torus crease) the 3D layer columns twist, giving 115 inverted cells out of 245k. Fixing this is the top priority. Real geometry is full of such junctions, for example wing roots.
+- **Sharp concave junctions are not fully solved.** Where convex edges meet a concave crease (e.g. two intersecting boxes) or two bodies intersect (sphere ∪ torus), the layer mesh has 0 inverted cells but OpenFOAM's default `checkMesh` still flags a handful of wrongly oriented / skew faces, and the wall surface is visibly rough along the junction. This is the main open problem; real geometry (wing roots, fillets) depends on it.
+- **Thin sharp trailing edges at fine sizing.** On the ONERA M6 wing the default sizing gives a valid mesh (0 inverted cells; checkMesh flags a few dozen skewed faces at the trailing edge, and `mantle_report.md` points them out), but finer surface sizing currently produces inverted cells at the trailing edge. Leading edges whose radius is smaller than the surface cell size are under-resolved, because the hex core needs one uniform cell size along the shell (transition templates are on the roadmap).
 - **2D speed and angles:** the 2D prototype is pure Python, and its minimum angles in the SU2 export are worse than Gmsh's.
 - **Not yet benchmarked in 3D:** no 3D benchmark against Gmsh, snappyHexMesh or cfMesh yet, and no 3D force validation.
 - **Strict checks flag a known artefact:** OpenFOAM's optional `-allGeometry` check flags 2:1 octree transition cells as "concave". This is a round-off effect on exactly coplanar faces, and snappyHexMesh meshes show the same flag.
 
 ## Roadmap
 
-1. 3D layers at concave junctions: streamline/harmonic column directions (the method that solved this in 2D) plus local stack reduction.
-2. 3D validation: sphere and 3D wing at y+ ≈ 1 against snappyHexMesh, cfMesh and Gmsh, plus experimental data.
-3. Variable δ(x) shell in 3D (eikonal) and the topological validity oracle.
-4. Conforming 2:1 templates (an all-hex core); parallel optimiser; Python bindings (PyO3).
-5. ML sizing: predict δ(x), first-cell height and layer count from geometry plus Re/Ma, with a verify loop ([spec](docs/ML_SIZING_SPEC_v1.md)).
+- [x] 2D prototype validated against snappyHexMesh, Gmsh and NASA TMR data
+- [x] 3D inside/outside, octree, hex core + pillow layer, OpenFOAM and SU2 writers
+- [x] 3D boundary layers on smooth and sharp-convex bodies; filleted shell at concave creases
+- [x] `mantle` command line: STL in, solver-ready case out
+- [x] Mesh health report: input checks, checkMesh-equivalent metrics, localised issues with suggestions
+- [ ] Sharp concave junctions and thin trailing edges: front-collision handling (T-Rex-style transition cells)
+- [ ] Octree transition templates on the shell, so curvature-based sizing can refine leading edges and tips
+- [ ] 3D validation at y+ ≈ 1: sphere drag, wing–body junction, against snappyHexMesh, cfMesh and Gmsh
+- [ ] Python bindings (PyO3) and `pip install`
+- [ ] Conforming 2:1 templates (all-hex core), parallel optimiser, GPU geometry stage
+- [ ] ML sizing: predict δ(x), first-cell height and layer count from geometry plus Re/Ma ([spec](docs/ML_SIZING_SPEC_v1.md))
 
 ## Repository layout
 
 | Path | Contents |
 |---|---|
-| `rcore/` | Rust core, std only, no dependencies: `dexel` (tri-dexel sampling), `fwn` (fast winding numbers, 3rd order), `bvh` (closest point, segment hits), `octree` (size field, 2:1 balance, cut data), `hexcore` (hex core + pillow + optimiser), `layers` (3D boundary layers), `cutmesh` (cut-cell variant), `foam` / `su2` writers. Benchmarks are in `src/bin/`. |
+| `rcore/` | Rust core, std only, no dependencies: `stl` (reader), `dexel` (tri-dexel sampling), `fwn` (fast winding numbers, 3rd order), `bvh` (closest point, segment hits), `octree` (size field, 2:1 balance, cut data), `shell` (filleted offset shell), `hexcore` (hex core + pillow + optimiser), `layers` (3D boundary layers), `features` (sharp edges, intersection curves, corners), `pipeline` (end-to-end), `cutmesh` (cut-cell variant), `foam` / `su2` writers. The `mantle` command line and benchmarks are in `src/bin/`. |
+| `examples/` | Example STL files and how to run them. |
 | `proto2d/` | 2D prototype (`sfhm2d_v1.py` … `v7`, each version kept), plus the comparison harnesses (snappy, Gmsh, SU2, OpenFOAM), Cp/Cf plotting, and 3D test harnesses. |
 | `RESEARCH_volume_meshing_v1.md`, `RESEARCH_literature_v2.md` | Literature review, method design and novelty check. |
-| `docs/` | The ML sizing specification and the figures. |
+| `docs/` | The ML sizing specification, the figures and the scripts that render them. |
 
-## Quick start
+## Contributing
 
-```bash
-# Rust core
-cd rcore && cargo test --release && cargo build --release
+Test geometries that break your current mesher (or mantle) are the most valuable contribution right now. Open a [geometry request](https://github.com/Syphonicc/mantle/issues/new?template=geometry_request.md) or see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-# 2D prototype (Python 3, numpy, scipy, matplotlib)
-python3 proto2d/sfhm2d_v7.py --geom twoelement --out runs/twoelement --plot --su2
+If mantle is useful or interesting to you, a ⭐ on GitHub helps others find it.
 
-# 3D hex core + boundary layers (input: little-endian triangle soup, see rcore/src/bin/hexcore_bench.rs)
-rcore/target/release/hexcore_bench soup.bin origin=-1.5,-1.5,-1.5 size=3.2 L=7 h_surf=0.025 grade=0.25 \
-    h_max=0.4 delta=0.1 layers=12 dy0=1.8e-3 growth=1.25 out_dir
-```
+## Citation
 
-OpenFOAM v2512 and SU2 v8.5 were used for validation. Gmsh 4.15 and snappyHexMesh were used as baselines.
+If you use mantle in your work, please cite it via [CITATION.cff](CITATION.cff) (GitHub's "Cite this repository" button).
 
 ## License
 

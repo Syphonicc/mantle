@@ -63,19 +63,6 @@ pub struct Su2Stats {
 
 const NB: [[usize; 3]; 8] = [[1, 3, 4], [2, 0, 5], [3, 1, 6], [0, 2, 7], [7, 5, 0], [4, 6, 1], [5, 7, 2], [6, 4, 3]];
 
-/// Unit-normal alignment of the corner turns of a quad (vertices in order): minimum over the 4 corners of
-/// cos(angle between corner normal and the diagonal normal); > 0.2 means convex in projection and not strongly twisted.
-fn quad_flatness(p: &[V3; 4]) -> f64 {
-    let n = cross(sub(p[2], p[0]), sub(p[3], p[1]));
-    let nl = dot(n, n).sqrt().max(1e-300);
-    (0..4)
-        .map(|i| {
-            let t = cross(sub(p[(i + 1) % 4], p[i]), sub(p[(i + 2) % 4], p[(i + 1) % 4]));
-            dot(t, n) / (dot(t, t).sqrt().max(1e-300) * nl)
-        })
-        .fold(f64::INFINITY, f64::min)
-}
-const QUAD_FLAT_MIN: f64 = 0.2;
 
 /// Validity of one SU2 element; `p` holds the node coordinates in SU2/VTK order (tet 4, pyramid 5, hex 8).
 pub fn element_valid(ty: u8, p: &[V3]) -> bool {
@@ -84,11 +71,10 @@ pub fn element_valid(ty: u8, p: &[V3]) -> bool {
         14 => {
             let q = [p[0], p[1], p[2], p[3]];
             let a = p[4];
-            tet_vol(q[0], q[1], q[2], a) > 0.0
-                && tet_vol(q[0], q[2], q[3], a) > 0.0
-                && tet_vol(q[0], q[1], q[3], a) > 0.0
-                && tet_vol(q[1], q[2], q[3], a) > 0.0
-                && quad_flatness(&q) > QUAD_FLAT_MIN
+            // all four corner tets positive, with a small slack for slightly warped / nearly flat bases (SU2 accepts those)
+            let l = (0..4).map(|i| dot(sub(q[i], a), sub(q[i], a)).sqrt()).fold(0.0, f64::max);
+            let tol = -1e-6 * l * l * l;
+            tet_vol(q[0], q[1], q[2], a) > tol && tet_vol(q[0], q[2], q[3], a) > tol && tet_vol(q[0], q[1], q[3], a) > tol && tet_vol(q[1], q[2], q[3], a) > tol
         }
         13 => {
             // VTK wedge: (0,1,2) is clockwise seen from (3,4,5), i.e. left-handed relative to Gmsh; map to Gmsh order and test the 6 corners
@@ -174,13 +160,8 @@ fn triangulate(pts: &[V3], v: &[u32]) -> (Option<V3>, Vec<[u32; 3]>, Vec<usize>)
 fn split_face(pts: &[V3], v: &[u32]) -> Option<(Option<V3>, Vec<[u32; 3]>)> {
     match v.len() {
         3 => None,
-        4 => {
-            let q: [V3; 4] = std::array::from_fn(|i| pts[v[i] as usize]);
-            if quad_flatness(&q) > QUAD_FLAT_MIN {
-                return None;
-            }
-            Some((None, diag_split(pts, v)))
-        }
+        // quads stay native (SU2 handles non-planar quads); only the apex fallback in `write_su2` splits them
+        4 => None,
         n => {
             let (c, tris, _) = triangulate(pts, v);
             Some(match c {
@@ -210,6 +191,13 @@ fn diag_split(pts: &[V3], v: &[u32]) -> Vec<[u32; 3]> {
 enum Item {
     Tri([u32; 3]),
     Quad([u32; 4]),
+}
+
+fn item_has(it: &Item, v: u32) -> bool {
+    match it {
+        Item::Tri(t) => t.contains(&v),
+        Item::Quad(q) => q.contains(&v),
+    }
 }
 
 fn rev3(t: [u32; 3]) -> [u32; 3] {
@@ -361,11 +349,25 @@ pub fn write_su2(m: &CutMesh, path: &Path) -> std::io::Result<Su2Stats> {
             ftri[fi] = tris;
         }
     }
+    // cells written as native elements need no apex decomposition (their faces stay quads / triangles, non-planar quads are fine for SU2)
+    let native_ok = |ci: usize, c: &crate::cutmesh::Cell| -> bool {
+        if let Some(&(ty, e)) = m.native.get(&(ci as u32)) {
+            let n = if ty == 13 { 6 } else if ty == 10 { 4 } else { 5 };
+            if element_valid(ty, &e[..n].iter().map(|&i| pts[i as usize]).collect::<Vec<V3>>()) {
+                return true;
+            }
+        }
+        c.hex.is_some_and(|h| element_valid(12, &h.iter().map(|&i| pts[i as usize]).collect::<Vec<V3>>()))
+    };
     // Fallback for cells without a valid apex: split all their plain quads into triangles (shared with the neighbours,
     // so the mesh stays conforming) and retry, up to three rounds.
+    let mut vapex: std::collections::HashMap<usize, u32> = Default::default();
     for _ in 0..3 {
         let mut changed = false;
         for (ci, c) in m.cells.iter().enumerate() {
+            if native_ok(ci, c) || vapex.contains_key(&ci) {
+                continue;
+            }
             let mut items: Vec<Item> = Vec::new();
             for &f in &c.faces {
                 let fc = &m.faces[f as usize];
@@ -382,7 +384,34 @@ pub fn write_su2(m: &CutMesh, path: &Path) -> std::io::Result<Su2Stats> {
                 }
             }
             let pl = |i: u32| pts[i as usize];
-            if find_apex(&pl, &items).1 == 0 {
+            let fa = find_apex(&pl, &items);
+            if fa.1 == 0 {
+                continue;
+            }
+            // vertex apex (collapsed cells such as wedges whose kernel is a vertex / edge): pyramids over the faces not touching the apex vertex;
+            // the faces touching it are fanned from it (shared with the neighbours through `ftri`)
+            let mut vs: Vec<u32> = c.faces.iter().flat_map(|&f| m.faces[f as usize].verts.iter().cloned()).collect();
+            vs.sort_unstable();
+            vs.dedup();
+            let ok_at = |v: u32| {
+                let ap = pts[v as usize];
+                items.iter().filter(|it| !item_has(it, v)).all(|it| match it {
+                    Item::Tri(t) => element_valid(10, &[pl(t[0]), pl(t[2]), pl(t[1]), ap]),
+                    Item::Quad(q) => element_valid(14, &[pl(q[0]), pl(q[3]), pl(q[2]), pl(q[1]), ap]),
+                })
+            };
+            if let Some(&v) = vs.iter().find(|&&v| ok_at(v)) {
+                for &f in &c.faces {
+                    let w = &m.faces[f as usize].verts;
+                    if w.len() == 4 && ftri[f as usize].is_empty() {
+                        if let Some(i) = w.iter().position(|&x| x == v) {
+                            ftri[f as usize] = vec![[w[i], w[(i + 1) % 4], w[(i + 2) % 4]], [w[i], w[(i + 2) % 4], w[(i + 3) % 4]]];
+                            st.quads_split += 1;
+                        }
+                    }
+                }
+                vapex.insert(ci, v);
+                changed = true;
                 continue;
             }
             for &f in &c.faces {
@@ -458,6 +487,16 @@ pub fn write_su2(m: &CutMesh, path: &Path) -> std::io::Result<Su2Stats> {
             } else {
                 items.push(Item::Quad(if own { [v[0], v[1], v[2], v[3]] } else { [v[3], v[2], v[1], v[0]] }));
             }
+        }
+        if let Some(&v) = vapex.get(&ci) {
+            let z = 0;
+            for it in items.iter().filter(|it| !item_has(it, v)) {
+                match it {
+                    Item::Tri(t) => push(&mut st, &pts, 10, [t[0], t[2], t[1], v, z, z, z, z]),
+                    Item::Quad(p) => push(&mut st, &pts, 14, [p[0], p[3], p[2], p[1], v, z, z, z]),
+                }
+            }
+            continue;
         }
         let (ap, _bad, moved) = {
             let pl = |i: u32| pts[i as usize];

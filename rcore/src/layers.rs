@@ -28,6 +28,16 @@ use crate::tree::par_map;
 use std::time::Instant;
 
 type V3 = [f64; 3];
+/// Position-based (lexicographic) tie-break between equidistant points.
+fn lex_less(a: V3, b: V3) -> bool {
+    for d in 0..3 {
+        if a[d] != b[d] {
+            return a[d] < b[d];
+        }
+    }
+    false
+}
+
 fn sub(a: V3, b: V3) -> V3 {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
@@ -64,6 +74,9 @@ pub struct LayerOptions {
     pub cont_rings: usize,
     /// front-collision termination: adjacent columns whose cells invert above some level share their nodes from there up (prism / pyramid transition cells)
     pub zip: bool,
+    /// harmonic columns: a cluster of columns whose wall points coincide (a convex fan) is only merged into one wall node when its spokes (wall node -> shell vertex)
+    /// span more than this angle (degrees); shallow facet edges of a coarse tessellation are treated as smooth (feet stay separate, streamline ends). 0 = always merge
+    pub feature_angle: f64,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -539,7 +552,13 @@ impl Harmonic {
                 }
             }
         }
-        let org = [0, 1, 2].map(|d| lo[d] - dband - 4.0 * hg);
+        // grid planes at ctr + (j + 1/2) hg: the grid is mirror-symmetric about the bbox centre planes, so a body symmetric about one of them
+        // (an airfoil about its chord plane) gets a symmetric field; a lo-anchored origin put the planes at an arbitrary phase of the mid plane
+        let org = [0, 1, 2].map(|d| {
+            let ctr = 0.5 * (lo[d] + hi[d]);
+            let j = ((ctr - lo[d] + dband + 4.0 * hg) / hg - 0.5).ceil();
+            ctr - (j + 0.5) * hg
+        });
         let marg = dband + 2.0 * hg;
         let bs = 8i64;
         let mut bmap: Map<u64, [i64; 3]> = Map::default();
@@ -933,9 +952,9 @@ struct Col {
     tri: u32,
 }
 
-/// Ranking of a layer mesh (smaller is better): invalid cells, topological defects, bad face pyramids, then the worst Jacobian.
+/// Ranking of a layer mesh (smaller is better): topological defects (orphan faces / orientation mismatches are holes), invalid cells, bad face pyramids, then the worst Jacobian.
 fn mesh_key(st: &LayerStats) -> (usize, usize, usize, f64) {
-    (st.n_nonpositive, st.orient_mismatch + st.nonmanifold, st.n_bad_pyr, -st.sj_min.max(-1.0))
+    (st.orient_mismatch + st.nonmanifold, st.n_nonpositive, st.n_bad_pyr, -st.sj_min.max(-1.0))
 }
 
 /// Build the boundary-layer mesh on top of a hex-core mesh. `hc.shell` must carry the mesh ids (`mesh_pid`, `mesh_face`).
@@ -958,6 +977,7 @@ pub fn build(hc: &HexCore, tris: &[Tri], opt: &LayerOptions) -> LayerMesh {
     // every round as (n_nonpositive, -sj_min, number of forced merges, switched columns): the best few are polished at the end
     let mut cands: Vec<((usize, usize, usize, f64), usize, Vec<bool>)> = Vec::new();
     let (mut rounds, mut stale) = (0, 0);
+    let mut best_state: (usize, Vec<bool>) = (0, Vec::new());
     let mut pass0 = 0;
     loop {
         let (mut lm, pairs, badc) = build_pass(hc, &bvh, opt, &forced, &fs, &traces, &feat, false);
@@ -971,6 +991,7 @@ pub fn build(hc: &HexCore, tris: &[Tri], opt: &LayerOptions) -> LayerMesh {
         cands.push((mesh_key(&lm.stats), forced.len(), fs.clone()));
         if better {
             stale = 0;
+            best_state = (forced.len(), fs.clone());
             best = Some(lm);
         } else {
             stale += 1;
@@ -978,6 +999,32 @@ pub fn build(hc: &HexCore, tris: &[Tri], opt: &LayerOptions) -> LayerMesh {
         let newfs: Vec<u32> = badc.into_iter().filter(|&i| !fs[i as usize]).collect();
         if (pairs.is_empty() && newfs.is_empty()) || rounds >= 12 || stale >= 3 || opt.repair_sj <= 0.0 || best.as_ref().unwrap().stats.n_nonpositive == 0 && best.as_ref().unwrap().stats.sj_min >= opt.repair_sj && stale > 0 {
             let mut b = best.unwrap();
+            // manifold fixup: the repair rounds trade quality against holes; if the best round still has faces covered by three cells (orphans), keep merging wall
+            // nodes of exactly those quads (no quality-driven merges, which would create new overlaps elsewhere) until none is left
+            if b.stats.nonmanifold > 0 {
+                let mut fz = forced[..best_state.0].to_vec();
+                let mut o2 = opt.clone();
+                o2.repair_sj = 0.0;
+                for _ in 0..60 {
+                    let (lm, pairs, _) = build_pass(hc, &bvh, &o2, &fz, &best_state.1, &traces, &feat, false);
+                    let done = lm.stats.nonmanifold == 0;
+                    let stuck = pairs.is_empty();
+                    if done || mesh_key(&lm.stats) < mesh_key(&b.stats) {
+                        let mut lm = lm;
+                        lm.stats.repair_rounds = rounds;
+                        lm.stats.repair_merges = fz.len();
+                        // earlier rounds' candidates index prefixes of the old `forced`: replace them all by the repaired state
+                        forced = fz.clone();
+                        cands.clear();
+                        cands.push((mesh_key(&lm.stats), forced.len(), best_state.1.clone()));
+                        b = lm;
+                    }
+                    if done || stuck {
+                        break;
+                    }
+                    fz.extend(pairs);
+                }
+            }
             let prepolish = b.stats.n_nonpositive;
             // final polish (Laplacian smoothing + untangling) of the best few rounds; rounds are compared before polishing, which they
             // respond to very differently, so a runner-up can end up better
@@ -1320,6 +1367,38 @@ fn build_pass(hc: &HexCore, bvh: &Bvh, opt: &LayerOptions, forced: &[(u32, u32)]
             }
         }
     }
+    // shallow facet edges: clusters whose spokes span less than `feature_angle` are not fans, their columns keep separate (streamline) feet
+    if opt.feature_angle > 0.0 && !traces.is_empty() {
+        let mut keep = vec![false; nv];
+        for &(a, b) in forced {
+            keep[a as usize] = true;
+            keep[b as usize] = true;
+        }
+        let mut cl: Map<u32, Vec<u32>> = Map::default();
+        for i in 0..nv as u32 {
+            let r = find(&mut parent, i);
+            cl.entry(r).or_default().push(i);
+        }
+        let cos_lim = |a: f64| a.to_radians().cos();
+        for m in cl.values().filter(|m| m.len() > 1) {
+            if m.iter().any(|&i| keep[i as usize] || fixed[i as usize] || own_foot[i as usize] || traces.get(i as usize).is_none_or(|t| t.code != 0)) {
+                continue;
+            }
+            let sp: Vec<V3> = m.iter().map(|&i| {
+                let d = sub(sh.pts[i as usize], cols[i as usize].w);
+                let l = norm(d).max(1e-300);
+                [d[0] / l, d[1] / l, d[2] / l]
+            }).collect();
+            let mut c = [0.0; 3];
+            sp.iter().for_each(|d| (0..3).for_each(|k| c[k] += d[k]));
+            let cn = norm(c);
+            // spread = twice the largest angle to the mean spoke
+            let cmin = if cn < 1e-12 { -1.0 } else { sp.iter().map(|d| dot(*d, c) / cn).fold(1.0, f64::min) };
+            if cmin > cos_lim(0.5 * opt.feature_angle) {
+                m.iter().for_each(|&i| parent[i as usize] = i);
+            }
+        }
+    }
     let mut wid = vec![u32::MAX; nv];
     let mut wnodes: Vec<V3> = Vec::new();
     let mut root_id: Map<u32, u32> = Map::default();
@@ -1347,14 +1426,29 @@ fn build_pass(hc: &HexCore, bvh: &Bvh, opt: &LayerOptions, forced: &[(u32, u32)]
                     c[d] += cols[i as usize].w[d] / m.len() as f64;
                 }
             }
-            let (_, w, _) = bvh.closest(c);
-            wnodes.push(w);
+            // The node is the cluster centroid projected onto the wall. At a convex edge the centroid of feet on a slightly kinked edge lies
+            // inside the wedge, (nearly) equidistant from both faces: the closest-point tie then puts the node on one face, off the edge by up
+            // to the kink sagitta (the same side every time; of the order of the first cell height). In that case take the member foot nearest
+            // to the centroid instead: it is exactly on the wall / edge; exact distance ties go by position, not index.
+            let (d, w, _) = bvh.closest(c);
+            if bvh.near_tie(c, d, w, 0.5, 1e-3 * d.max(tol)) {
+                let mut best: Option<(f64, V3)> = None;
+                for &i in m {
+                    let f = cols[i as usize].w;
+                    let dd = norm(sub(f, c));
+                    if best.is_none_or(|(bd, bf)| dd < bd - 1e-12 * size || (dd <= bd + 1e-12 * size && lex_less(f, bf))) {
+                        best = Some((dd, f));
+                    }
+                }
+                wnodes.push(best.unwrap().1);
+            } else {
+                wnodes.push(w);
+            }
         }
     }
     for i in 0..nv {
         cols[i].w = wnodes[wid[i] as usize];
     }
-    let _ = &cols;
     st.wall_nodes = wnodes.len();
     st.merged_wall_nodes = nv - wnodes.len();
 
@@ -1613,7 +1707,19 @@ fn build_pass(hc: &HexCore, bvh: &Bvh, opt: &LayerOptions, forced: &[(u32, u32)]
                     }
                     st.wall_faces += 1;
                 }
+                let nm0 = fb.nonmanifold;
                 fl.push(fb.add(&v, ci, patch));
+                if fb.nonmanifold > nm0 {
+                    // the face already has two cells (a wall triangle covered twice where the foot map folds, e.g. at a thin trailing edge): collapse the whole stack
+                    // of this quad onto one wall node (pyramid frustum) in the next repair round
+                    for t in 0..4 {
+                        let (a, b) = (qv[t], qv[(t + 1) % 4]);
+                        let p = (a.min(b) as u32, a.max(b) as u32);
+                        if wid[a] != wid[b] && !forced.contains(&p) && !bad_pairs.contains(&p) {
+                            bad_pairs.push(p);
+                        }
+                    }
+                }
             }
             let hh = (sh.pts[qv[0]][0] - sh.pts[qv[1]][0]).abs().max(1e-300);
             let _ = hh;
@@ -1653,6 +1759,10 @@ fn build_pass(hc: &HexCore, bvh: &Bvh, opt: &LayerOptions, forced: &[(u32, u32)]
             // OpenFOAM face-pyramid check, with a margin (checkMesh decides on volumes of order 1e-15 where rounding of the written points matters)
             if (sj.is_nan() || sj < 0.3) && foam_pyramid_score(&pts, l, u) < PYR_MIN {
                 st.n_bad_pyr += 1;
+                // a degenerate (poly) cell with an inverted face pyramid, typically three merged feet and one loose foot on a convex edge: complete the fan
+                if opt.repair_sj > 0.0 && sj.is_nan() {
+                    repair_pick(k, &qv, &wid, &cols, sh, forced, &snapped, &mut bad_pairs);
+                }
             }
             if opt.repair_sj > 0.0 && !sj.is_nan() && (sj <= 0.0 || (k == 0 && sj < opt.repair_sj)) {
                 repair_pick(k, &qv, &wid, &cols, sh, forced, &snapped, &mut bad_pairs);
@@ -2334,7 +2444,7 @@ mod tests {
         let (hc, delta) = core(&tris, -1.5, 3.2, 6);
         let (nl, r) = (8usize, 1.2);
         let dy0 = fit_dy0(delta, nl, r);
-        let lm = build(&hc, &tris, &LayerOptions { features: false, cont: 0, cont_rings: 3, zip: false, n: nl, dy0, growth: r, snap: 0.4, repair_sj: 0.05, columns: Columns::Nearest, smooth_sweeps: 0, hg_k: 8.0 });
+        let lm = build(&hc, &tris, &LayerOptions { features: false, cont: 0, cont_rings: 3, zip: false, n: nl, dy0, growth: r, snap: 0.4, repair_sj: 0.05, columns: Columns::Nearest, smooth_sweeps: 0, hg_k: 8.0, feature_angle: 0.0 });
         let (s, m) = (&lm.stats, &lm.mesh);
         println!("layers: {}", s.json());
         assert_eq!(s.n_nonpositive, 0);
@@ -2347,8 +2457,16 @@ mod tests {
         // columns whose wall node was not merged: first cell within 1 % of dy0, stack spans |v - w| = delta
         let bvh = Bvh::new(&tris);
         let (mut unmerged, mut bad_first) = (0usize, 0usize);
+        // a merged node may coincide with one member's own closest point: columns sharing their wall node count as merged
+        let mut share: Map<u32, usize> = Map::default();
+        for i in 0..hc.shell.pts.len() {
+            *share.entry(lm.nodes[i * (nl + 1)]).or_insert(0) += 1;
+        }
         for i in 0..hc.shell.pts.len() {
             let nd = &lm.nodes[i * (nl + 1)..(i + 1) * (nl + 1)];
+            if share[&nd[0]] > 1 {
+                continue;
+            }
             let (foot, top) = (m.points[nd[0] as usize], hc.shell.pts[i]);
             assert_eq!(nd[nl], hc.shell.mesh_pid[i]);
             let w = bvh.closest(top).1;
@@ -2392,7 +2510,7 @@ mod tests {
         let (hc, delta) = core(&tris, -1.0, 2.0, 5);
         let (nl, r) = (6usize, 1.2);
         let dy0 = fit_dy0(delta, nl, r);
-        let lm = build(&hc, &tris, &LayerOptions { features: false, cont: 0, cont_rings: 3, zip: false, n: nl, dy0, growth: r, snap: 0.4, repair_sj: 0.05, columns: Columns::Nearest, smooth_sweeps: 0, hg_k: 8.0 });
+        let lm = build(&hc, &tris, &LayerOptions { features: false, cont: 0, cont_rings: 3, zip: false, n: nl, dy0, growth: r, snap: 0.4, repair_sj: 0.05, columns: Columns::Nearest, smooth_sweeps: 0, hg_k: 8.0, feature_angle: 0.0 });
         let (s, m) = (&lm.stats, &lm.mesh);
         println!("layers cube: {}", s.json());
         assert!(s.prism > 0 && s.pyramid > 0, "no wedges / pyramids at the cube edges / corners");
@@ -2536,7 +2654,7 @@ mod tests {
         let (hc, _) = core(&tris, -1.0, 2.0, 6);
         let (nl, r) = (8usize, 1.25);
         let dy0 = fit_dy0(4.0 * 2.0 / 64.0, nl, r);
-        let lm = build(&hc, &tris, &LayerOptions { features: true, cont: 0, cont_rings: 3, zip: false, n: nl, dy0, growth: r, snap: 0.4, repair_sj: 0.05, columns: Columns::Harmonic, smooth_sweeps: 25, hg_k: 8.0 });
+        let lm = build(&hc, &tris, &LayerOptions { features: true, cont: 0, cont_rings: 3, zip: false, n: nl, dy0, growth: r, snap: 0.4, repair_sj: 0.05, columns: Columns::Harmonic, smooth_sweeps: 25, hg_k: 8.0, feature_angle: 0.0 });
         let s = &lm.stats;
         println!("cross features: {}", s.json());
         assert_eq!(s.feat.mixed_corners, 8);
@@ -2549,7 +2667,7 @@ mod tests {
         let (hc, delta) = core(tris, org, size, l);
         let r = 1.25;
         let dy0 = fit_dy0(delta, nl, r);
-        let lm = build(&hc, tris, &LayerOptions { features: false, cont: 0, cont_rings: 3, zip: false, n: nl, dy0, growth: r, snap: 0.4, repair_sj: 0.05, columns: Columns::Harmonic, smooth_sweeps: 25, hg_k: 8.0 });
+        let lm = build(&hc, tris, &LayerOptions { features: false, cont: 0, cont_rings: 3, zip: false, n: nl, dy0, growth: r, snap: 0.4, repair_sj: 0.05, columns: Columns::Harmonic, smooth_sweeps: 25, hg_k: 8.0, feature_angle: 0.0 });
         (lm, hc, dy0)
     }
 
@@ -2580,7 +2698,7 @@ mod tests {
         let (nl, r) = (8usize, 1.25);
         let delta = 4.0 * 2.0 / 64.0;
         let dy0 = fit_dy0(delta, nl, r);
-        let mk = |c| build(&hc, &tris, &LayerOptions { features: false, cont: 0, cont_rings: 3, zip: false, n: nl, dy0, growth: r, snap: 0.4, repair_sj: 0.05, columns: c, smooth_sweeps: if c == Columns::Harmonic { 25 } else { 0 }, hg_k: 8.0 });
+        let mk = |c| build(&hc, &tris, &LayerOptions { features: false, cont: 0, cont_rings: 3, zip: false, n: nl, dy0, growth: r, snap: 0.4, repair_sj: 0.05, columns: c, smooth_sweeps: if c == Columns::Harmonic { 25 } else { 0 }, hg_k: 8.0, feature_angle: 0.0 });
         let (hm, nr) = (mk(Columns::Harmonic), mk(Columns::Nearest));
         println!("cross nearest : {}", nr.stats.json());
         println!("cross harmonic: {}", hm.stats.json());

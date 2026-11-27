@@ -33,8 +33,11 @@
 //! Module 8, `shell`: opened shell (offset surface with concave-crease ridges replaced by fillets of radius rho; `ShellField`: psi, projection, ray
 //! tracing; fast-marching field on a sparse grid), used by `hexcore` (`Options::fillet`) and `layers` (harmonic band bounded by psi = 0).
 //!
+//! `stl` reads ASCII / binary STL; `pipeline` runs the whole shell-first chain (used by `hexcore_bench` and the `mantle` CLI).
+//!
 //! Dependency-free (std only); parallel with `std::thread::scope`.
 
+pub mod checks;
 pub mod dexel;
 pub mod tree;
 pub mod fwn;
@@ -47,3 +50,8 @@ pub mod hexcore;
 pub mod layers;
 pub mod shell;
 pub mod features;
+pub mod stl;
+pub mod sizing;
+pub mod pipeline;
+pub mod quality;
+pub mod report;

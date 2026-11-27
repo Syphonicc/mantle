@@ -632,7 +632,7 @@ mod tests {
         }
         let (nl, r) = (6usize, 1.25);
         let dy0 = layers::fit_dy0(delta, nl, r);
-        let lm = layers::build(&hc, &tris, &LayerOptions { features: false, cont: 0, cont_rings: 3, zip: false, n: nl, dy0, growth: r, snap: 0.4, repair_sj: 0.05, columns: Columns::Harmonic, smooth_sweeps: 25, hg_k: 8.0 });
+        let lm = layers::build(&hc, &tris, &LayerOptions { features: false, cont: 0, cont_rings: 3, zip: false, n: nl, dy0, growth: r, snap: 0.4, repair_sj: 0.05, columns: Columns::Harmonic, smooth_sweeps: 25, hg_k: 8.0, feature_angle: 0.0 });
         println!("fillet layers: {}", lm.stats.json());
         assert_eq!((lm.stats.orient_mismatch, lm.stats.nonmanifold), (0, 0));
     }

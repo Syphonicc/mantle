@@ -203,7 +203,10 @@ pub fn refine_needed_shell(sh: &ShellFn, sf: &SizeField, c: [f64; 3], size: f64)
                 return size > sf.h_max;
             }
             let dist = sh.dist(c, d, hd);
-            size > sf.h((dist - hd).max(0.0), tri) || (dist <= hd && size > sf.h_surf_of(tri))
+            // a cell wholly between wall and shell (or in the solid) is dropped by the clip: only the global surface size applies there
+            // (the curvature-refined size of the nearest wall triangle would fill the band with leaves that are thrown away)
+            let hs = if d + hd < sh.delta { sf.h_surf } else { sf.h_surf_of(tri) };
+            size > (hs + sf.grade * (dist - hd).max(0.0)).min(sf.h_max) || (dist <= hd && size > hs)
         }
     }
 }
@@ -690,7 +693,7 @@ impl Octree {
                     Some(sh) => bvh.closest_within(c, hd + sh.delta).is_some_and(|(d, _, _)| sh.dist(c, d, hd) <= hd),
                 }
             };
-            Self::buffer(&mut sets, origin, size, &surf);
+            Self::buffer(&mut sets, origin, size, sf.tri_h.is_some(), &surf);
         }
         Self::balance(&mut sets);
         tm.balance = t.elapsed().as_secs_f64();
@@ -809,7 +812,7 @@ impl Octree {
 
     /// Conformity buffer: a surface leaf of level l forces the leaf containing each of its 26 same-level neighbour cells
     /// down to level l. Splits one level per pass; new surface children and sources that still had a violation go again.
-    fn buffer(sets: &mut [Set], origin: [f64; 3], size: f64, surf: &(dyn Fn([f64; 3], f64) -> bool + Sync)) {
+    fn buffer(sets: &mut [Set], origin: [f64; 3], size: f64, graded: bool, surf: &(dyn Fn([f64; 3], f64) -> bool + Sync)) {
         let ll = sets.len() - 1;
         let is_surface = |l: usize, p: u64| -> bool {
             let cs = size / (1u64 << l) as f64;
@@ -845,7 +848,9 @@ impl Octree {
                             let sh = l - a;
                             let q = pack((ni >> sh) as u32, (nj >> sh) as u32, (nk >> sh) as u32);
                             if sref[a].contains(&q) {
-                                if a < l {
+                                // `graded` (per-triangle surface sizes): a surface leaf one level coarser is a legitimate surface size
+                                // transition, not a conformity violation (else the finest level floods the whole surface)
+                                if a < l && !(graded && a + 1 == l && is_surface(a, q)) {
                                     split.push((a as u8, q));
                                     viol = true;
                                 }

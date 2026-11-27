@@ -79,6 +79,7 @@ fn sj_bin(s: f64) -> usize {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct Options {
     /// offset-shell distance (must equal the octree's `Clip::Shell` delta)
     pub delta: f64,

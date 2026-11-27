@@ -121,6 +121,39 @@ impl Bvh {
         (best.0.sqrt(), best.1, best.2)
     }
 
+    /// True when another triangle has a closest point to `q` that lies within `(1 + rel) d` of `q` and further than `gap` from `w`
+    /// (`d`, `w` = the closest hit): `q` is (nearly) on the medial axis, e.g. inside a thin wedge, so the closest point is an arbitrary
+    /// one of several and a different triangle order would pick another.
+    pub fn near_tie(&self, q: V, d: f64, w: V, rel: f64, gap: f64) -> bool {
+        if self.tree.nodes.is_empty() {
+            return false;
+        }
+        let lim = d * (1.0 + rel);
+        let lim2 = lim * lim;
+        let mut stack = [0u32; 128];
+        let mut sp = 1;
+        while sp > 0 {
+            sp -= 1;
+            let nd = &self.tree.nodes[stack[sp] as usize];
+            if box_d2(q, nd.lo, nd.hi) > lim2 {
+                continue;
+            }
+            if nd.left == NONE {
+                for i in nd.start as usize..(nd.start + nd.count) as usize {
+                    let c = closest_pt_triangle(q, &self.tris[i]);
+                    if dot(sub(q, c), sub(q, c)) <= lim2 && dot(sub(c, w), sub(c, w)) > gap * gap {
+                        return true;
+                    }
+                }
+            } else {
+                stack[sp] = nd.left;
+                stack[sp + 1] = nd.right;
+                sp += 2;
+            }
+        }
+        false
+    }
+
     /// Closest hit within `max_dist` (inclusive), else None. Prunes with `max_dist` from the start.
     pub fn closest_within(&self, q: V, max_dist: f64) -> Option<Hit> {
         let mut best = (max_dist * max_dist, [f64::NAN; 3], NONE);
