@@ -26,6 +26,8 @@ usage: mantle INPUT.stl -o CASE_DIR [options]
   --feature-angle DEG  wall-node fans only at edges sharper than this (default 25; shallower facet edges are treated as smooth)
   --edge-nodes on|off  structured fans: wall nodes of columns on sharp convex edges from a 1D discretisation of the edge curve (experimental, default off = cluster feet by proximity)
   --curvature on|off   curvature-based surface sizing: h = clamp(c R, h_min, h_surf) per triangle (default OFF, experimental: the hex core / pillow needs one uniform shell level, so size transitions on the shell break it, see README of the sizing module); sharp edges (dihedral > 60 deg) are ignored
+  --graded-shell on|off graded conforming shell (experimental, default off): shell quads may change size 2:1 (surface T-join + face templates, `surfq`), so curvature sizing can refine leading edges and tips; off = one uniform shell level
+  --grade-z Z --grade-fac F  test hook: triangles with centroid z > Z get the surface size F * h_surf (default F 0.5); use with --graded-shell on
   --curv-c C           cells per radius of curvature, h = C R (default 0.25, ~25 cells per circle)
   --h-min H            smallest surface size (default h_surf / 8; the octree gets at most 3 extra levels)
   --su2-only           write only CASE_DIR/mesh.su2
@@ -58,6 +60,9 @@ struct Cli {
     angle: f64,
     edge_nodes: bool,
     curvature: bool,
+    graded: bool,
+    grade_z: Option<f64>,
+    grade_fac: f64,
     curv_c: f64,
     h_min: Option<f64>,
     su2: bool,
@@ -69,7 +74,7 @@ struct Cli {
 }
 
 fn parse_args(args: &[String]) -> Result<Option<Cli>, String> {
-    let mut c = Cli { input: PathBuf::new(), out: PathBuf::new(), yplus: None, re: None, dy0: None, layers: None, growth: 1.2, delta: None, h_surf: None, farfield: 5.0, preset: "medium".into(), level: None, fillet: 1.0, angle: 25.0, edge_nodes: false, curvature: false, curv_c: 0.25, h_min: None, su2: true, foam: true, quiet: false, json: false, force: false, report_only: false };
+    let mut c = Cli { input: PathBuf::new(), out: PathBuf::new(), yplus: None, re: None, dy0: None, layers: None, growth: 1.2, delta: None, h_surf: None, farfield: 5.0, preset: "medium".into(), level: None, fillet: 1.0, angle: 25.0, edge_nodes: false, curvature: false, graded: false, grade_z: None, grade_fac: 0.5, curv_c: 0.25, h_min: None, su2: true, foam: true, quiet: false, json: false, force: false, report_only: false };
     let (mut have_in, mut have_out) = (false, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -92,6 +97,9 @@ fn parse_args(args: &[String]) -> Result<Option<Cli>, String> {
             "--feature-angle" => c.angle = num(val("DEG")?, a)?,
             "--edge-nodes" => c.edge_nodes = match val("on|off")?.as_str() { "on" => true, "off" => false, o => return Err(format!("--edge-nodes: on|off, got '{o}'")) },
             "--curvature" => c.curvature = match val("on|off")?.as_str() { "on" => true, "off" => false, o => return Err(format!("--curvature: on|off, got '{o}'")) },
+            "--graded-shell" => c.graded = match val("on|off")?.as_str() { "on" => true, "off" => false, o => return Err(format!("--graded-shell: on|off, got '{o}'")) },
+            "--grade-z" => c.grade_z = Some(val("Z")?.parse::<f64>().map_err(|e| format!("--grade-z: {e}"))?),
+            "--grade-fac" => c.grade_fac = num(val("F")?, a)?,
             "--curv-c" => c.curv_c = num(val("C")?, a)?,
             "--h-min" => c.h_min = Some(num(val("H")?, a)?),
             "--su2-only" => c.foam = false,
@@ -281,13 +289,15 @@ fn run(c: &Cli) -> Result<(), String> {
         h_surf,
         grade: 0.25,
         delta,
-        opt: Options { fillet: c.fillet, ..Options::default() },
+        opt: Options { fillet: c.fillet, graded_shell: c.graded, ..Options::default() },
         nlayers: n,
         dy0: dy0_req.unwrap_or(-1.0),
         growth: c.growth,
         feature_angle: c.angle,
         edge_nodes: c.edge_nodes,
         curvature: c.curvature,
+        grade_z: c.grade_z,
+        grade_fac: c.grade_fac,
         curv: CurvOptions { c: c.curv_c, h_min: c.h_min.unwrap_or(0.0), ..CurvOptions::default() },
         write_foam: c.foam,
         write_su2: c.su2,
@@ -306,7 +316,7 @@ fn run(c: &Cli) -> Result<(), String> {
         fillet: c.fillet,
         level,
         domain: side,
-        note: note.clone(),
+        note: if c.graded { format!("{}{}graded shell: {} faces with odd hanging parity, {} join edges (longest path {}), templates T0/Tc/Ts/T4 {}/{}/{}/{}, {} transition cells, {} shell levels, {} cells removed for parity", note, if note.is_empty() { "" } else { "; " }, r.hc.odd_faces, r.hc.tjoin_edges, r.hc.tjoin_max_path, r.hc.tpl_count[0], r.hc.tpl_count[1], r.hc.tpl_count[2], r.hc.tpl_count[3], r.hc.transition_cells, r.hc.shell_levels, r.hc.removed_parity) } else { note.clone() },
         cells: r.cells,
         hex: r.hex_cells,
         poly: r.poly_cells,

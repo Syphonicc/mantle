@@ -27,6 +27,8 @@
 //! a one-hex pillow layer from the core boundary to the projected shell quads instead of cut cells; cleanup of non-manifold
 //! boundary and bad projection normals, Jacobian-guarded smoothing); assembled as a `CutMesh` so `foam` / `su2` write it.
 //!
+//! `surfq`: graded, conforming shell quad meshes (polygon surface of the core boundary, surface T-join, face templates; `hexcore::Options::graded_shell`).
+//!
 //! Module 7, `layers`: boundary layers between wall and the offset shell (columns: streamlines of a harmonic field in the band, solved with PCG
 //! on a sparse grid, or straight nearest-point columns; geometric node distribution along the arc length, hexes / prisms / pyramids at merged wall nodes, patch `wall`).
 //!
@@ -46,6 +48,7 @@ pub mod octree;
 pub mod cutmesh;
 pub mod foam;
 pub mod su2;
+pub mod surfq;
 pub mod hexcore;
 pub mod layers;
 pub mod shell;

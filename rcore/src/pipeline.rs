@@ -44,11 +44,15 @@ pub struct MeshSpec {
     pub curvature: bool,
     pub curv: CurvOptions,
     pub extra_levels: u8,
+    /// synthetic grading (tests / bench): triangles with centroid z > `grade_z` get the surface size `grade_fac * h_surf` (the octree gets the
+    /// extra levels needed); combined with `curvature` by taking the minimum
+    pub grade_z: Option<f64>,
+    pub grade_fac: f64,
 }
 
 impl Default for MeshSpec {
     fn default() -> Self {
-        MeshSpec { origin: [0.0; 3], size: 1.0, lmax: 6, h_surf: 0.0, grade: 0.2, h_max: f64::INFINITY, delta: -1.0, mode: SignMode::Dexel, opt: Options::default(), nlayers: 0, dy0: -1.0, growth: 1.25, snap: 0.4, repair_sj: 0.05, features: false, cont: 0, cont_rings: 3, zip: false, columns: Columns::Harmonic, hg_k: 8.0, feature_angle: 0.0, edge_nodes: false, smooth: -1, write_foam: true, write_su2: true, write_shell_quads: false, curvature: false, curv: CurvOptions::default(), extra_levels: 3 }
+        MeshSpec { origin: [0.0; 3], size: 1.0, lmax: 6, h_surf: 0.0, grade: 0.2, h_max: f64::INFINITY, delta: -1.0, mode: SignMode::Dexel, opt: Options::default(), nlayers: 0, dy0: -1.0, growth: 1.25, snap: 0.4, repair_sj: 0.05, features: false, cont: 0, cont_rings: 3, zip: false, columns: Columns::Harmonic, hg_k: 8.0, feature_angle: 0.0, edge_nodes: false, smooth: -1, write_foam: true, write_su2: true, write_shell_quads: false, curvature: false, curv: CurvOptions::default(), extra_levels: 3, grade_z: None, grade_fac: 0.5 }
     }
 }
 
@@ -95,6 +99,8 @@ pub struct Summary {
     pub growth_min: f64,
     pub growth_max: f64,
     pub t_report: f64,
+    /// hex-core statistics (graded shell counters etc.)
+    pub hc: crate::hexcore::HcStats,
 }
 
 /// Run the pipeline on `tris` and write the requested outputs under `out`.
@@ -129,6 +135,19 @@ pub fn run_with(tris: &[Tri], spec: &MeshSpec, out: &Path, geom: Option<&crate::
         lvl = spec.lmax + extra;
         sf.tri_h = Some(th);
         curv = Some(st);
+    }
+    if let Some(zc) = spec.grade_z {
+        let fine = spec.grade_fac.clamp(1e-3, 1.0);
+        let mut th = sf.tri_h.take().unwrap_or_else(|| vec![h_surf; tris.len()]);
+        for (t, h) in tris.iter().zip(th.iter_mut()) {
+            if (t[0][2] + t[1][2] + t[2][2]) / 3.0 > zc {
+                *h = h.min(h_surf * fine);
+            }
+        }
+        let cs = spec.size / (1u64 << spec.lmax) as f64;
+        let hmin = th.iter().cloned().fold(f64::INFINITY, f64::min);
+        lvl = lvl.max(spec.lmax + ((cs / hmin).log2().ceil().max(0.0) as u8).min(spec.extra_levels));
+        sf.tri_h = Some(th);
     }
     let t_sizing = t0.elapsed().as_secs_f64();
     let oc = Octree::build_clipped(tris, spec.origin, spec.size, lvl, &sf, 0, spec.mode, Clip::Shell { delta });
@@ -186,8 +205,8 @@ pub fn run_with(tris: &[Tri], spec: &MeshSpec, out: &Path, geom: Option<&crate::
     let stg = |x: &hexcore::SjStage| format!("{{\"min\": {:e}, \"mean\": {:.6}, \"n_lt_0p1\": {}, \"n_lt_0p2\": {}, \"n_lt_0p3\": {}}}", x.min, x.mean, x.n_lt_0p1, x.n_lt_0p2, x.n_lt_0p3);
     let lj = lm.as_ref().map_or(String::new(), |l| format!(", \"layers\": {}, \"t_layers_total\": {:.3}", l.stats.json(), t_layers));
     let ext = format!(
-        ", \"sj_min_initial\": {:e}, \"sj_min_after_smooth\": {:e}, \"sj_min_after_opt\": {:e}, \"n_sj_below_0p1\": {}, \"n_sj_below_0p3\": {}, \"opt_sweeps\": {}, \"moved_core_vertices\": {}, \"core_sj_min\": {:e}, \"t_opt\": {:.3}, \"fillet\": {}, \"ridge_nodes\": {}, \"grid_nodes\": {}, \"t_shell\": {:.3}, \"stage_initial\": {}, \"stage_smooth\": {}, \"stage_opt\": {}",
-        s.stage_initial.min, s.stage_smooth.min, s.stage_opt.min, s.n_sj_below_0p1, s.n_sj_below_0p3, s.opt_sweeps, s.moved_core_vertices, s.core_sj_min, s.t_opt, opt.fillet, s.ridge_nodes, s.grid_nodes, s.t_shell, stg(&s.stage_initial), stg(&s.stage_smooth), stg(&s.stage_opt)
+        ", \"sj_min_initial\": {:e}, \"sj_min_after_smooth\": {:e}, \"sj_min_after_opt\": {:e}, \"n_sj_below_0p1\": {}, \"n_sj_below_0p3\": {}, \"opt_sweeps\": {}, \"moved_core_vertices\": {}, \"core_sj_min\": {:e}, \"t_opt\": {:.3}, \"fillet\": {}, \"ridge_nodes\": {}, \"grid_nodes\": {}, \"t_shell\": {:.3}, \"stage_initial\": {}, \"stage_smooth\": {}, \"stage_opt\": {}, \"graded_shell\": {}, \"odd_faces\": {}, \"tjoin_edges\": {}, \"tjoin_max_path\": {}, \"tpl_count\": [{}, {}, {}, {}], \"shell_faces\": {}, \"shell_levels\": {}, \"transition_cells\": {}, \"removed_parity\": {}",
+        s.stage_initial.min, s.stage_smooth.min, s.stage_opt.min, s.n_sj_below_0p1, s.n_sj_below_0p3, s.opt_sweeps, s.moved_core_vertices, s.core_sj_min, s.t_opt, opt.fillet, s.ridge_nodes, s.grid_nodes, s.t_shell, stg(&s.stage_initial), stg(&s.stage_smooth), stg(&s.stage_opt), opt.graded_shell, s.odd_faces, s.tjoin_edges, s.tjoin_max_path, s.tpl_count[0], s.tpl_count[1], s.tpl_count[2], s.tpl_count[3], s.shell_faces, s.shell_levels, s.transition_cells, s.removed_parity
     ) + &lj;
     let h = |a: &[usize; 5]| format!("[{}, {}, {}, {}, {}]", a[0], a[1], a[2], a[3], a[4]);
     let json = format!(
@@ -243,5 +262,6 @@ pub fn run_with(tris: &[Tri], spec: &MeshSpec, out: &Path, geom: Option<&crate::
         growth_min: ls.map_or(0.0, |l| l.growth_min),
         growth_max: ls.map_or(0.0, |l| l.growth_max),
         t_report,
+        hc: hc.stats.clone(),
     })
 }

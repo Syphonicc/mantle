@@ -1010,6 +1010,48 @@ impl Octree {
         let c = vertex_coords(key);
         [self.origin[0] + c[0] as f64 * u, self.origin[1] + c[1] as f64 * u, self.origin[2] + c[2] as f64 * u]
     }
+    /// Physical position of a doubled-lattice key (`surfq::key2`): exact for every key, lattice points included.
+    pub fn vertex_pos2(&self, key: u64) -> [f64; 3] {
+        let u = self.size / (1u64 << self.max_level) as f64 * 0.5;
+        let c = vertex_coords(key);
+        [self.origin[0] + c[0] as f64 * u, self.origin[1] + c[1] as f64 * u, self.origin[2] + c[2] as f64 * u]
+    }
+    /// Octree from a refinement predicate `refine(level, i, j, k)` (cells of level `l0` upwards, at most `max_level`), 26-neighbour
+    /// balanced, with its leaf-corner vertices and all corner signs `false` (no cuts): a checker / test helper.
+    pub fn from_refinement(origin: [f64; 3], size: f64, max_level: u8, l0: u8, refine: &dyn Fn(u8, u32, u32, u32) -> bool) -> Octree {
+        assert!(max_level <= MAX_LEVEL && l0 <= max_level);
+        let ll = max_level as usize;
+        let mut sets: Vec<Set> = (0..=ll).map(|_| Set::default()).collect();
+        let mut stack: Vec<(u8, u32, u32, u32)> = Vec::new();
+        for k in 0..1u32 << l0 {
+            for j in 0..1u32 << l0 {
+                for i in 0..1u32 << l0 {
+                    stack.push((l0, i, j, k));
+                }
+            }
+        }
+        while let Some((l, i, j, k)) = stack.pop() {
+            if l < max_level && refine(l, i, j, k) {
+                for n in 0..8u32 {
+                    stack.push((l + 1, 2 * i + (n & 1), 2 * j + ((n >> 1) & 1), 2 * k + ((n >> 2) & 1)));
+                }
+            } else {
+                sets[l as usize].insert(pack(i, j, k));
+            }
+        }
+        Self::balance(&mut sets);
+        let mut leaves: Vec<Leaf> = Vec::new();
+        for (l, s) in sets.iter().enumerate() {
+            for &p in s {
+                let [i, j, k] = unpack(p);
+                leaves.push(Leaf { level: l as u8, i, j, k });
+            }
+        }
+        let mut oc = Self::from_leaves(origin, size, max_level, leaves);
+        oc.vkeys = oc.unique_vertices();
+        oc.vsign = vec![false; oc.vkeys.len()];
+        oc
+    }
     /// Sorted unique leaf-corner vertex keys.
     pub fn vertices(&self) -> &[u64] {
         &self.vkeys
@@ -1102,6 +1144,27 @@ mod tests {
     fn morton_roundtrip() {
         for &(i, j, k) in &[(0u32, 0u32, 0u32), (1, 2, 3), (1 << 20, (1 << 20) - 1, 12345)] {
             assert_eq!(morton_decode(morton_encode(i, j, k)), [i, j, k]);
+        }
+    }
+
+    #[test]
+    fn from_refinement_is_balanced() {
+        // deterministic pseudo-random refinement; the result must be vertex (26-neighbour) balanced and tile the cube
+        let mut st = 0x9e3779b97f4a7c15u64;
+        let mut rnd = move || {
+            st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (st >> 33) as u32
+        };
+        for _ in 0..8 {
+            let seeds: Vec<[u32; 3]> = (0..4).map(|_| [rnd() % 32, rnd() % 32, rnd() % 32]).collect();
+            let oc = Octree::from_refinement(ORG, SZ, 5, 1, &|l, i, j, k| {
+                let s = 5 - l;
+                seeds.iter().any(|c| (c[0] >> s) == i && (c[1] >> s) == j && (c[2] >> s) == k)
+            });
+            assert_eq!(oc.balance_violations(), 0);
+            let vol: f64 = oc.leaves().iter().map(|l| oc.leaf_size(l).powi(3)).sum();
+            assert!((vol - SZ.powi(3)).abs() < 1e-9);
+            assert!(!oc.vertices().is_empty());
         }
     }
 

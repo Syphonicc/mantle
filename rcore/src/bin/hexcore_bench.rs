@@ -1,5 +1,5 @@
 //! hexcore_bench SOUP.bin origin=x,y,z size=S L=N h_surf=H grade=G h_max=M [delta=D (4*h_surf)] [gamma=0.3] [theta_max=60] [max_proj_h=2.5]
-//! [smooth_iters=5] [core_move=0] [max_rounds=5] [sj_remove=0] [opt_sweeps=0] [opt_core=1] [opt_ring=0] [opt_init=1] [max_removed_frac=0.03] [fillet=0 (rho/delta)] [fillet_k=8] [signs=fwn|dexel] [layers=0] [dy0=] [growth=1.25] [snap=0.4] [repair_sj=0.05] [features=0|1 (default 0)] [cont=0|1|2 (continuous foot map near collision seams / everywhere)] [cont_rings=3] [columns=harmonic|nearest] [hg_k=8] [smooth=25 (harmonic) | 0 (nearest)] OUT_DIR
+//! [smooth_iters=5] [core_move=0] [max_rounds=5] [sj_remove=0] [opt_sweeps=0] [opt_core=1] [opt_ring=0] [opt_init=1] [max_removed_frac=0.03] [fillet=0 (rho/delta)] [fillet_k=8] [graded_shell=0|1 (graded conforming shell, default 0)] [grade_z=Z grade_fac=0.5 (synthetic grading: surface size grade_fac * h_surf for triangles with centroid z > Z)] [signs=fwn|dexel] [layers=0] [dy0=] [growth=1.25] [snap=0.4] [repair_sj=0.05] [features=0|1 (default 0)] [cont=0|1|2 (continuous foot map near collision seams / everywhere)] [cont_rings=3] [columns=harmonic|nearest] [hg_k=8] [smooth=25 (harmonic) | 0 (nearest)] OUT_DIR
 //! `fillet=F` opens the shell at concave creases with fillet radius rho = F delta (`rcore::shell`, grid spacing delta/fillet_k); 0 = plain offset shell.
 //! `layers=N` adds N boundary layers between wall and shell (`rcore::layers`; dy0 default: stack fit for `growth`); patches `wall`, `farfield`.
 //! `columns=harmonic` (default): streamline columns of a harmonic field in the band (grid spacing delta/hg_k); `columns=nearest`: straight nearest-point columns.
@@ -45,6 +45,7 @@ fn main() {
     let mut feature_angle = 0.0f64;
     let mut edge_nodes = false;
     let (mut curvature, mut curv_c) = (false, 0.25f64);
+    let (mut grade_z, mut grade_fac) = (None::<f64>, 0.5f64);
     let (mut columns, mut hg_k, mut smooth) = (Columns::Harmonic, 8.0f64, -1i64);
     for a in &args[2..args.len() - 1] {
         let (k, v) = a.split_once('=').unwrap_or_else(|| panic!("bad arg {a}"));
@@ -78,6 +79,9 @@ fn main() {
             "opt_init" => opt.opt_init = v == "1",
             "fillet" => opt.fillet = v.parse().unwrap(),
             "fillet_k" => opt.fillet_k = v.parse().unwrap(),
+            "graded_shell" => opt.graded_shell = v == "1",
+            "grade_z" => grade_z = Some(v.parse().unwrap()),
+            "grade_fac" => grade_fac = v.parse().unwrap(),
             "sj_remove" => opt.sj_remove = v.parse().unwrap(),
             "layers" => nlayers = v.parse().unwrap(),
             "dy0" => dy0 = v.parse().unwrap(),
@@ -108,7 +112,7 @@ fn main() {
             _ => panic!("unknown key {k}"),
         }
     }
-    let spec = MeshSpec { origin, size, lmax, h_surf, grade, h_max, delta, mode, opt, nlayers, dy0, growth, snap, repair_sj, features: features_on, cont: cont_mode, cont_rings, zip: zip_on, columns, hg_k, feature_angle, edge_nodes, smooth, write_foam: true, write_su2: true, write_shell_quads: true, curvature, curv: rcore::sizing::CurvOptions { c: curv_c, ..Default::default() }, extra_levels: 3 };
+    let spec = MeshSpec { origin, size, lmax, h_surf, grade, h_max, delta, mode, opt, nlayers, dy0, growth, snap, repair_sj, features: features_on, cont: cont_mode, cont_rings, zip: zip_on, columns, hg_k, feature_angle, edge_nodes, smooth, write_foam: true, write_su2: true, write_shell_quads: true, curvature, curv: rcore::sizing::CurvOptions { c: curv_c, ..Default::default() }, extra_levels: 3, grade_z, grade_fac };
     match pipeline::run(&tris, &spec, &out) {
         Ok(r) => println!("{}", r.json),
         Err(e) => {

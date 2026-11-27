@@ -6,6 +6,11 @@
 //!   quad that has a hanging vertex on an edge, or whose face towards a finer neighbour is only partly core (split boundary face), are
 //!   removed; so are the cells of non-manifold boundary edges (more than two quads; the owner with the smallest margin) and of
 //!   non-manifold boundary vertices (boundary quads around the vertex form several fans; all fans but the largest).
+//! * `Options::graded_shell` (see `surfq`, `docs/GRADED_SHELL_DESIGN_v1.md`): boundary quads with hanging vertices stay; faces towards finer
+//!   neighbours that are only partly core contribute one boundary quarter face per non-core finer leaf (no `removed_split`); the leaf margin
+//!   is `gamma` times the size of the coarsest leaf in its neighbourhood. The boundary faces form a polygon surface P (hanging midpoints are
+//!   polygon vertices), a surface T-join restores even parity, face templates give the all-quad shell mesh Q that the pillow and the layers
+//!   use; core cells owning a transition face or touching a join edge are polyhedra with frozen vertices (`edge_points`).
 //! * Normal cleanup: every boundary vertex `v` has the projection target `t = w + delta (v - w)/|v - w|` (`w` = nearest wall
 //!   point, i.e. the exact closest point of the shell). If the angle between `t - v` and the area-weighted vertex normal exceeds
 //!   `theta_max`, or `|t - v|` exceeds `max_proj_h` cell edges, all leaves touching `v` are removed. Boundary quads whose pillow
@@ -24,7 +29,8 @@ use crate::bvh::Bvh;
 use crate::cutmesh::{geom, ring, Cell, CutMesh, Face, Map, FARFIELD, INTERNAL, NONE, ORPHAN, WALL};
 use crate::dexel::Tri;
 use crate::fwn::Fwn;
-use crate::octree::{vertex_key, Octree};
+use crate::octree::{vertex_coords, vertex_key, Octree};
+use crate::surfq::{key2, BFace, QMesh, Surface, TJoin};
 use crate::shell::ShellField;
 use crate::tree::par_map;
 use std::thread;
@@ -116,11 +122,14 @@ pub struct Options {
     pub fillet: f64,
     /// grid spacing of the fillet field: `delta / fillet_k`
     pub fillet_k: f64,
+    /// graded conforming shell (`surfq`): boundary faces with hanging vertices stay in the core; a surface T-join and face templates
+    /// give an all-quad shell mesh for the pillow and the layers (default off: such cells are removed, one uniform shell level)
+    pub graded_shell: bool,
 }
 
 impl Default for Options {
     fn default() -> Options {
-        Options { delta: 0.0, gamma: 0.3, theta_max: 60.0, max_proj_h: 2.5, smooth_iters: 5, core_move: 0.0, max_rounds: 5, sj_remove: 0.0, max_removed_frac: 0.03, remove_all_incident: false, opt_sweeps: 30, opt_core: true, opt_ring: false, opt_init: true, opt_cap: 0.5, opt_min_step: 0.02, fillet: 0.0, fillet_k: 8.0 }
+        Options { delta: 0.0, gamma: 0.3, theta_max: 60.0, max_proj_h: 2.5, smooth_iters: 5, core_move: 0.0, max_rounds: 5, sj_remove: 0.0, max_removed_frac: 0.03, remove_all_incident: false, opt_sweeps: 30, opt_core: true, opt_ring: false, opt_init: true, opt_cap: 0.5, opt_min_step: 0.02, fillet: 0.0, fillet_k: 8.0, graded_shell: false }
     }
 }
 
@@ -199,6 +208,17 @@ pub struct HcStats {
     pub ridge_nodes: usize,
     pub grid_nodes: usize,
     pub t_shell: f64,
+    /// graded shell: faces with an odd number of hanging sides, join edges, longest BFS path, faces per template (T0, Tc, Ts, T4),
+    /// boundary faces of P, distinct leaf levels among them, core cells made polyhedral by the shell (masked face or join edge),
+    /// cells removed because an odd component had no partner (assumptions of Theorem 1 failed)
+    pub odd_faces: usize,
+    pub tjoin_edges: usize,
+    pub tjoin_max_path: usize,
+    pub tpl_count: [usize; 4],
+    pub shell_faces: usize,
+    pub shell_levels: usize,
+    pub transition_cells: usize,
+    pub removed_parity: usize,
 }
 
 /// Projected shell quads for the layer step (points on the shell, shell normals pointing away from the wall, nearest wall
@@ -241,15 +261,23 @@ fn project(sf: &ShellField, x: V3) -> Tgt {
     Tgt { t, w, tri }
 }
 
-/// Boundary quad of the core: owner leaf, lattice corners in right-hand order about the outward (out of the core) normal.
-#[derive(Clone, Copy)]
-struct BQ {
-    leaf: u32,
-    key: [u64; 4],
-    h: f64,
+/// Boundary quad of the core: owner leaf, doubled-lattice corner keys in right-hand order about the outward (out of the core) normal,
+/// hanging-side mask (`surfq::BFace`).
+type BQ = BFace;
+
+/// Shell mesh of one boundary face set: polygon surface P, its T-join and the quad mesh Q (`qb`: the Q quads as boundary quads of
+/// their parent leaf). Without `graded_shell` Q is P itself.
+#[derive(Default)]
+struct ShellMesh {
+    surf: Option<Surface>,
+    tj: TJoin,
+    q: QMesh,
+    qb: Vec<BQ>,
+    /// join edges as sorted doubled-key pairs
+    jpairs: Vec<(u64, u64)>,
 }
 
-type Out = (Vec<BQ>, Vec<u64>, Vec<V3>, Vec<V3>, Vec<[u32; 4]>, usize);
+type Out = (ShellMesh, Vec<u64>, Vec<V3>, Vec<V3>, Vec<[u32; 4]>, usize);
 
 struct Scan {
     bq: Vec<BQ>,
@@ -278,11 +306,20 @@ struct GeomRes {
     ray_targets: usize,
     max_proj_h: f64,
     hmax: Vec<f64>,
+    sm: ShellMesh,
 }
 
 /// A closest-point target is only accepted if its direction makes more than this cosine with every incident quad normal (else the
 /// pillow hex would be folded at that corner).
 const FACE_COS_MIN: f64 = 0.0;
+
+/// The four quarter faces of a face with lattice corners `lat` (ring order), one per corner: `[lat[t], side mid, centre, side mid]`;
+/// the same quads the assembly emits for a face towards finer neighbours.
+fn face_quarters(lat: &[[u32; 3]; 4]) -> [[[u32; 3]; 4]; 4] {
+    let m: [[u32; 3]; 4] = std::array::from_fn(|t| std::array::from_fn(|d| (lat[t][d] + lat[(t + 1) % 4][d]) / 2));
+    let c: [u32; 3] = std::array::from_fn(|d| (lat[0][d] + lat[2][d]) / 2);
+    [[lat[0], m[0], c, m[3]], [m[0], lat[1], m[1], c], [c, m[1], lat[2], m[2]], [m[3], c, m[2], lat[3]]]
+}
 
 /// First intersection of the ray `v + s dir` with the shell (sphere tracing on psi), `s <= smax`.
 fn ray_target(sf: &ShellField, v: V3, dir: V3, smax: f64) -> Option<Tgt> {
@@ -314,6 +351,13 @@ struct Work<'a> {
     /// min over corners of psi / h per leaf
     cmin: Vec<f64>,
     cache: Map<u64, Tgt>,
+    graded: bool,
+    /// graded shell: lattice midpoints of the coarse edges of faces with boundary quarter faces; they are vertices of P although no core
+    /// leaf has them as a corner (`refresh_qv`, part of the hanging test `mid`)
+    qv: Map<u64, ()>,
+    /// join edges of the current shell mesh (sorted doubled-key pairs): the midpoint of such a lattice edge is inserted into every face
+    /// containing the edge (`edge_points`)
+    jset: Map<(u64, u64), ()>,
 }
 
 impl Work<'_> {
@@ -329,16 +373,129 @@ impl Work<'_> {
         true
     }
 
-    /// lattice midpoint of the edge `p q` if it is a vertex of a current core leaf (hanging node)
+    /// lattice midpoint of the edge `p q` if it is a vertex of a current core leaf (hanging node), or a corner of a boundary quarter face
     fn mid(&self, p: [u32; 3], q: [u32; 3]) -> Option<[u32; 3]> {
         if (0..3).any(|d| (p[d] + q[d]) % 2 != 0) {
             return None;
         }
         let m = [(p[0] + q[0]) / 2, (p[1] + q[1]) / 2, (p[2] + q[2]) / 2];
-        match self.oc.vertices().binary_search(&vertex_key(m[0], m[1], m[2])) {
+        let key = vertex_key(m[0], m[1], m[2]);
+        match self.oc.vertices().binary_search(&key) {
             Ok(i) if self.vcount[i] > 0 => Some(m),
+            _ if !self.qv.is_empty() && self.qv.contains_key(&key) => Some(m),
             _ => None,
         }
+    }
+
+    /// Recompute `qv` from the current core (graded shell only).
+    fn refresh_qv(&mut self) {
+        if !self.graded {
+            return;
+        }
+        let (oc, ml) = (self.oc, self.oc.max_level);
+        let leaves = oc.leaves();
+        let parts = par_ranges(leaves.len(), |rg| {
+            let mut out: Vec<u64> = Vec::new();
+            for li in rg {
+                if !self.core[li] {
+                    continue;
+                }
+                let l = leaves[li];
+                let (base, e) = geom(&l, ml);
+                let coord = |n: usize| [base[0] + e * (n as u32 & 1), base[1] + e * ((n as u32 >> 1) & 1), base[2] + e * ((n as u32 >> 2) & 1)];
+                for a in 0..3 {
+                    for s in 0..2 {
+                        if !self.neighbour(&l, a, s).is_some_and(|nb| leaves[nb].level > l.level) {
+                            continue;
+                        }
+                        let n_nc = self.sub_cells(&l, a, s).iter().filter(|x| !x.is_some_and(|x| self.core[x])).count();
+                        if (1..4).contains(&n_nc) {
+                            let r = ring(a, s);
+                            let lat: [[u32; 3]; 4] = std::array::from_fn(|t| coord(r[t]));
+                            for t in 0..4 {
+                                out.push(vertex_key((lat[t][0] + lat[(t + 1) % 4][0]) / 2, (lat[t][1] + lat[(t + 1) % 4][1]) / 2, (lat[t][2] + lat[(t + 1) % 4][2]) / 2));
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        });
+        self.qv = parts.into_iter().flatten().map(|k| (k, ())).collect();
+    }
+
+    /// Doubled-lattice keys of the points strictly inside the lattice edge `p q` that every face containing the edge must carry:
+    /// the hanging midpoint (a vertex of a finer core leaf, recursively for the halves) or the midpoint of a join edge. One helper
+    /// for every face of the assembly, so that cells sharing the edge stay conforming.
+    fn edge_points(&self, p: [u32; 3], q: [u32; 3], out: &mut Vec<u64>, join: &mut bool) {
+        if let Some(m) = self.mid(p, q) {
+            self.edge_points(p, m, out, join);
+            out.push(key2(m));
+            self.edge_points(m, q, out, join);
+        } else if !self.jset.is_empty() {
+            let (a, b) = (key2(p), key2(q));
+            if self.jset.contains_key(&(a.min(b), a.max(b))) {
+                out.push(vertex_key(p[0] + q[0], p[1] + q[1], p[2] + q[2]));
+                *join = true;
+            }
+        }
+    }
+
+    /// The four leaves across the face (axis `a`, side `s`) of `l` towards a finer neighbour, one per ring corner `t` (the one touching
+    /// the face corner `ring(a, s)[t]`, matching `face_quarters`).
+    fn sub_cells(&self, l: &crate::octree::Leaf, a: usize, s: usize) -> [Option<usize>; 4] {
+        let (u, v) = ((a + 1) % 3, (a + 2) % 3);
+        let lc = [l.i as i64, l.j as i64, l.k as i64];
+        let bits: [(i64, i64); 4] = if s == 1 { [(0, 0), (1, 0), (1, 1), (0, 1)] } else { [(0, 0), (0, 1), (1, 1), (1, 0)] };
+        bits.map(|(du, dv)| {
+            let mut f = [2 * lc[0], 2 * lc[1], 2 * lc[2]];
+            f[a] = if s == 1 { 2 * lc[a] + 2 } else { 2 * lc[a] - 1 };
+            f[u] += du;
+            f[v] += dv;
+            self.oc.leaf_containing(l.level + 1, f[0], f[1], f[2])
+        })
+    }
+
+    /// Does the leaf have a face towards a finer neighbour or a hanging vertex on one of its edges?
+    fn leaf_poly(&self, li: u32) -> bool {
+        let (leaves, ml) = (self.oc.leaves(), self.oc.max_level);
+        let l = leaves[li as usize];
+        let (base, e) = geom(&l, ml);
+        let coord = |n: usize| [base[0] + e * (n as u32 & 1), base[1] + e * ((n as u32 >> 1) & 1), base[2] + e * ((n as u32 >> 2) & 1)];
+        for a in 0..3 {
+            for s in 0..2 {
+                if self.neighbour(&l, a, s).is_some_and(|nb| leaves[nb].level > l.level) {
+                    return true;
+                }
+                let r = ring(a, s);
+                let lat: [[u32; 3]; 4] = std::array::from_fn(|t| coord(r[t]));
+                if (0..4).any(|t| self.mid(lat[t], lat[(t + 1) % 4]).is_some()) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Polygon surface P, T-join and quad mesh Q of the boundary faces `bq` (identity without `graded_shell`). An odd component
+    /// without an open edge leaves `tj.unmatched` non-empty (and Q = P).
+    fn shell_mesh(&self, bq: &[BQ]) -> ShellMesh {
+        if !self.graded {
+            return ShellMesh { qb: bq.to_vec(), ..Default::default() };
+        }
+        let surf = Surface::build(bq);
+        let pref: Vec<u8> = bq.iter().map(|f| (f.hang != 0 || self.leaf_poly(f.leaf)) as u8).collect();
+        let tj = surf.tjoin(&pref);
+        if !tj.unmatched.is_empty() {
+            return ShellMesh { qb: bq.to_vec(), surf: Some(surf), tj, ..Default::default() };
+        }
+        let q = surf.expand(&tj.mask);
+        let qb: Vec<BQ> = (0..q.quads.len()).map(|i| {
+            let f = &surf.faces[q.parent[i] as usize];
+            BQ { leaf: f.leaf, key: q.quads[i].map(|v| q.verts[v as usize]), h: f.h, hang: 0 }
+        }).collect();
+        let jpairs: Vec<(u64, u64)> = surf.edges.iter().zip(&tj.is_j).filter(|(_, j)| **j).map(|(e, _)| (e.a, e.b)).collect();
+        ShellMesh { surf: Some(surf), tj, q, qb, jpairs }
     }
 
     fn neighbour(&self, l: &crate::octree::Leaf, a: usize, s: usize) -> Option<usize> {
@@ -349,7 +506,8 @@ impl Work<'_> {
 
     /// Boundary quads of the core (faces towards non-core leaves) plus leaves to remove: boundary quads with a hanging vertex
     /// and leaves whose face towards finer neighbours is partly non-core.
-    fn scan(&self) -> Scan {
+    fn scan(&mut self) -> Scan {
+        self.refresh_qv();
         let oc = self.oc;
         let (leaves, ml) = (oc.leaves(), oc.max_level);
         let parts = par_ranges(leaves.len(), |rg| {
@@ -365,32 +523,40 @@ impl Work<'_> {
                     for s in 0..2 {
                         let Some(nb) = self.neighbour(&l, a, s) else { continue };
                         if leaves[nb].level > l.level {
-                            let (u, v) = ((a + 1) % 3, (a + 2) % 3);
-                            let lc = [l.i as i64, l.j as i64, l.k as i64];
-                            let mut bad = false;
-                            for dv in 0..2i64 {
-                                for du in 0..2i64 {
-                                    let mut f = [2 * lc[0], 2 * lc[1], 2 * lc[2]];
-                                    f[a] = if s == 1 { 2 * lc[a] + 2 } else { 2 * lc[a] - 1 };
-                                    f[u] += du;
-                                    f[v] += dv;
-                                    match oc.leaf_containing(l.level + 1, f[0], f[1], f[2]) {
-                                        Some(x) if self.core[x] => {}
-                                        _ => bad = true,
+                            // face towards four finer leaves: interior if all are core; boundary if none is; partly core: removed
+                            // (default), or with `graded_shell` one boundary quarter face per non-core finer leaf
+                            let sub = self.sub_cells(&l, a, s);
+                            let nc: [bool; 4] = sub.map(|x| !x.is_some_and(|x| self.core[x]));
+                            let n_nc = nc.iter().filter(|&&b| b).count();
+                            if n_nc == 0 {
+                                continue;
+                            }
+                            if !self.graded {
+                                split.push(li as u32);
+                                continue;
+                            }
+                            let r = ring(a, s);
+                            let lat: [[u32; 3]; 4] = std::array::from_fn(|t| coord(r[t]));
+                            if n_nc == 4 {
+                                let hm = (0..4).fold(0u8, |m, t| m | (self.mid(lat[t], lat[(t + 1) % 4]).is_some() as u8) << t);
+                                bq.push(BQ { leaf: li as u32, key: lat.map(key2), h: oc.leaf_size(&l), hang: hm });
+                            } else {
+                                for (t, q) in face_quarters(&lat).iter().enumerate() {
+                                    if nc[t] {
+                                        let hm = (0..4).fold(0u8, |m, t| m | (self.mid(q[t], q[(t + 1) % 4]).is_some() as u8) << t);
+                                        bq.push(BQ { leaf: li as u32, key: q.map(key2), h: 0.5 * oc.leaf_size(&l), hang: hm });
                                     }
                                 }
-                            }
-                            if bad {
-                                split.push(li as u32);
                             }
                         } else if !self.core[nb] {
                             let r = ring(a, s);
                             let lat: [[u32; 3]; 4] = std::array::from_fn(|t| coord(r[t]));
-                            if (0..4).any(|t| self.mid(lat[t], lat[(t + 1) % 4]).is_some()) {
+                            let hm = (0..4).fold(0u8, |m, t| m | (self.mid(lat[t], lat[(t + 1) % 4]).is_some() as u8) << t);
+                            if hm != 0 && !self.graded {
                                 hang.push(li as u32);
                             }
-                            let key = lat.map(|c| vertex_key(c[0], c[1], c[2]));
-                            bq.push(BQ { leaf: li as u32, key, h: oc.leaf_size(&l) });
+                            let key = lat.map(key2);
+                            bq.push(BQ { leaf: li as u32, key, h: oc.leaf_size(&l), hang: hm });
                         }
                     }
                 }
@@ -406,76 +572,17 @@ impl Work<'_> {
         sc
     }
 
-    /// Non-manifold boundary edges / vertices of the quad set and the leaves to remove for them.
+    /// Non-manifold boundary edges / vertices of the polygon surface P of the boundary faces and the leaves to remove for them
+    /// (edges with more than two faces: the owner with the smallest margin; vertices with several fans: all fans but the largest).
     fn manifold_scan(&self, bq: &[BQ]) -> ManRes {
-        let mut r = ManRes::default();
-        let mut ev: Vec<(u64, u64, u32)> = Vec::with_capacity(bq.len() * 4);
-        let mut vv: Vec<(u64, u32, u64, u64)> = Vec::with_capacity(bq.len() * 4);
-        for (qi, q) in bq.iter().enumerate() {
-            for t in 0..4 {
-                let (a, b) = (q.key[t], q.key[(t + 1) % 4]);
-                ev.push((a.min(b), a.max(b), qi as u32));
-                vv.push((a, qi as u32, q.key[(t + 3) % 4], b));
-            }
+        let mc = Surface::build(bq).manifold_check();
+        let mut r = ManRes { open_edges: mc.open_edges, nm_edges: mc.nm_edges.len(), nm_verts: mc.nm_verts, ..Default::default() };
+        for fs in &mc.nm_edges {
+            let best = fs.iter().map(|&f| bq[f as usize].leaf).min_by(|&a, &b| self.cmin[a as usize].partial_cmp(&self.cmin[b as usize]).unwrap()).unwrap();
+            r.rem.push(best);
         }
-        ev.sort_unstable();
-        vv.sort_unstable();
-        let mut i = 0;
-        while i < ev.len() {
-            let mut j = i;
-            while j < ev.len() && ev[j].0 == ev[i].0 && ev[j].1 == ev[i].1 {
-                j += 1;
-            }
-            match j - i {
-                1 => r.open_edges += 1,
-                2 => {}
-                _ => {
-                    r.nm_edges += 1;
-                    let best = (i..j).map(|k| bq[ev[k].2 as usize].leaf).min_by(|&a, &b| self.cmin[a as usize].partial_cmp(&self.cmin[b as usize]).unwrap()).unwrap();
-                    r.rem.push(best);
-                }
-            }
-            i = j;
-        }
-        let mut i = 0;
-        while i < vv.len() {
-            let mut j = i;
-            while j < vv.len() && vv[j].0 == vv[i].0 {
-                j += 1;
-            }
-            let g = &vv[i..j];
-            let n = g.len();
-            let mut par: Vec<usize> = (0..n).collect();
-            fn find(p: &mut Vec<usize>, mut x: usize) -> usize {
-                while p[x] != x {
-                    p[x] = p[p[x]];
-                    x = p[x];
-                }
-                x
-            }
-            for x in 0..n {
-                for y in x + 1..n {
-                    if g[x].2 == g[y].2 || g[x].2 == g[y].3 || g[x].3 == g[y].2 || g[x].3 == g[y].3 {
-                        let (rx, ry) = (find(&mut par, x), find(&mut par, y));
-                        par[rx] = ry;
-                    }
-                }
-            }
-            let roots: Vec<usize> = (0..n).map(|x| find(&mut par, x)).collect();
-            let mut sizes: Map<usize, usize> = Map::default();
-            for &rt in &roots {
-                *sizes.entry(rt).or_insert(0) += 1;
-            }
-            if sizes.len() > 1 {
-                r.nm_verts += 1;
-                let big = *sizes.iter().max_by_key(|(k, c)| (**c, std::cmp::Reverse(**k))).unwrap().0;
-                for x in 0..n {
-                    if roots[x] != big {
-                        r.rem.push(bq[g[x].1 as usize].leaf);
-                    }
-                }
-            }
-            i = j;
+        for &f in &mc.minor_faces {
+            r.rem.push(bq[f as usize].leaf);
         }
         r.rem.sort_unstable();
         r.rem.dedup();
@@ -498,6 +605,17 @@ impl Work<'_> {
             }
             let m = self.manifold_scan(&sc.bq);
             if m.rem.is_empty() {
+                if self.graded {
+                    // parity: an odd component without an open edge has no partner (not expected under Theorem 1): drop the owners
+                    let sm = self.shell_mesh(&sc.bq);
+                    if !sm.tj.unmatched.is_empty() {
+                        for &f in &sm.tj.unmatched {
+                            st.removed_parity += self.remove(sc.bq[f as usize].leaf) as usize;
+                        }
+                        st.manifold_iters += 1;
+                        continue;
+                    }
+                }
                 return sc.bq;
             }
             for &l in &m.rem {
@@ -520,13 +638,28 @@ impl Work<'_> {
         true
     }
 
-    /// All leaves touching the lattice vertex `key` (found through the 8 finest cells around it) whose core flag equals `core`.
+    /// All leaves touching the doubled-lattice point `key` (a vertex, edge midpoint or face centre; found through the finest cells whose
+    /// closed box contains it) whose core flag equals `core`.
     fn leaves_at_vertex(&self, key: u64, core: bool, out: &mut Vec<u32>) {
-        let c = crate::octree::vertex_coords(key);
+        let c = vertex_coords(key);
         let ml = self.oc.max_level;
         for n in 0..8i64 {
-            let (i, j, k) = (c[0] as i64 - 1 + (n & 1), c[1] as i64 - 1 + ((n >> 1) & 1), c[2] as i64 - 1 + ((n >> 2) & 1));
-            if let Some(x) = self.oc.leaf_containing(ml, i, j, k) {
+            let mut ijk = [0i64; 3];
+            let mut skip = false;
+            for d in 0..3 {
+                let bit = (n >> d) & 1;
+                if c[d] % 2 == 0 {
+                    ijk[d] = c[d] as i64 / 2 - 1 + bit;
+                } else if bit == 1 {
+                    skip = true;
+                } else {
+                    ijk[d] = (c[d] as i64 - 1) / 2;
+                }
+            }
+            if skip {
+                continue;
+            }
+            if let Some(x) = self.oc.leaf_containing(ml, ijk[0], ijk[1], ijk[2]) {
                 if self.core[x] == core {
                     out.push(x as u32);
                 }
@@ -555,17 +688,19 @@ impl Work<'_> {
     /// vertices without an acceptable target are bad and all leaves touching them are listed for removal.
     fn geom_pass(&mut self, bq: &[BQ], opt: &Options) -> GeomRes {
         let oc = self.oc;
+        let sm = self.shell_mesh(bq);
+        let bq = &sm.qb;
         let mut keys: Vec<u64> = bq.iter().flat_map(|q| q.key).collect();
         keys.sort_unstable();
         keys.dedup();
         let missing: Vec<u64> = keys.iter().copied().filter(|k| !self.cache.contains_key(k)).collect();
         let sf = self.sf;
-        let res = par_map(&missing, |&k| project(sf, oc.vertex_pos(k)));
+        let res = par_map(&missing, |&k| project(sf, oc.vertex_pos2(k)));
         for (k, t) in missing.into_iter().zip(res) {
             self.cache.insert(k, t);
         }
         let idx = |k: u64| keys.binary_search(&k).unwrap();
-        let pos: Vec<V3> = keys.iter().map(|&k| oc.vertex_pos(k)).collect();
+        let pos: Vec<V3> = keys.iter().map(|&k| oc.vertex_pos2(k)).collect();
         let mut nrm = vec![[0.0; 3]; keys.len()];
         let mut hmax = vec![0.0f64; keys.len()];
         let mut fn_: Vec<Vec<V3>> = vec![Vec::new(); keys.len()];
@@ -657,6 +792,7 @@ impl Work<'_> {
         g.nrm = nrm;
         g.hmax = hmax;
         g.keys = keys;
+        g.sm = sm;
         g
     }
 }
@@ -676,15 +812,18 @@ const T_FAR: u8 = 1;
 const T_SHELL: u8 = 2;
 
 impl Asm<'_> {
-    fn lat_id(&mut self, c: [u32; 3]) -> u32 {
-        let key = vertex_key(c[0], c[1], c[2]);
+    /// point id of a doubled-lattice key
+    fn id2(&mut self, key: u64) -> u32 {
         if let Some(&p) = self.pmap.get(&key) {
             return p;
         }
         let id = self.pts.len() as u32;
-        self.pts.push(self.oc.vertex_pos(key));
+        self.pts.push(self.oc.vertex_pos2(key));
         self.pmap.insert(key, id);
         id
+    }
+    fn lat_id(&mut self, c: [u32; 3]) -> u32 {
+        self.id2(key2(c))
     }
     fn add_face(&mut self, verts: Vec<u32>, tag: u8, cell: u32) -> u32 {
         if tag == T_SHELL {
@@ -786,9 +925,14 @@ struct OptRes {
 fn optimise(w: &Work, bvh: &Bvh, sf: &ShellField, bkeys: &[u64], hexq: &[[u32; 4]], hmax: &[f64], xs: &mut [V3], ps: &mut [V3], opt: &Options) -> OptRes {
     let (oc, vk, leaves, ml) = (w.oc, w.oc.vertices(), w.oc.leaves(), w.oc.max_level);
     let nbv = bkeys.len();
+    // octree vertex index of a doubled-lattice key (None for edge midpoints / face centres that are not leaf corners)
+    let vidx = |k2: u64| -> Option<usize> {
+        let c = vertex_coords(k2);
+        (c.iter().all(|x| x % 2 == 0)).then(|| vk.binary_search(&vertex_key(c[0] / 2, c[1] / 2, c[2] / 2)).ok()).flatten()
+    };
     let mut bidx = vec![u32::MAX; vk.len()];
     for (i, &k) in bkeys.iter().enumerate() {
-        if let Ok(j) = vk.binary_search(&k) {
+        if let Some(j) = vidx(k) {
             bidx[j] = i as u32;
         }
     }
@@ -802,6 +946,7 @@ fn optimise(w: &Work, bvh: &Bvh, sf: &ShellField, bkeys: &[u64], hexq: &[[u32; 4
         let (base, e) = geom(&l, ml);
         let coord = |n: usize| [base[0] + e * (n as u32 & 1), base[1] + e * ((n as u32 >> 1) & 1), base[2] + e * ((n as u32 >> 2) & 1)];
         let (mut poly, mut extra): (bool, Vec<[u32; 3]>) = (false, Vec::new());
+        let mut extra2: Vec<u64> = Vec::new();
         for a in 0..3 {
             for s in 0..2 {
                 let r = ring(a, s);
@@ -815,10 +960,13 @@ fn optimise(w: &Work, bvh: &Bvh, sf: &ShellField, bkeys: &[u64], hexq: &[[u32; 4
                         extra.push(std::array::from_fn(|d| (lat[0][d] + lat[2][d]) / 2));
                     }
                 }
+                // hanging midpoints and join-edge midpoints on the edges (faces with a non-empty split mask, join edges)
                 for t in 0..4 {
-                    if let Some(m) = w.mid(lat[t], lat[(t + 1) % 4]) {
+                    let mut ep: Vec<u64> = Vec::new();
+                    w.edge_points(lat[t], lat[(t + 1) % 4], &mut ep, &mut false);
+                    if !ep.is_empty() {
                         poly = true;
-                        extra.push(m);
+                        extra2.extend(ep);
                     }
                 }
             }
@@ -829,6 +977,11 @@ fn optimise(w: &Work, bvh: &Bvh, sf: &ShellField, bkeys: &[u64], hexq: &[[u32; 4
             }
             for m in extra {
                 if let Ok(j) = vk.binary_search(&vertex_key(m[0], m[1], m[2])) {
+                    fixed[j] = true;
+                }
+            }
+            for k in extra2 {
+                if let Some(j) = vidx(k) {
                     fixed[j] = true;
                 }
             }
@@ -855,7 +1008,7 @@ fn optimise(w: &Work, bvh: &Bvh, sf: &ShellField, bkeys: &[u64], hexq: &[[u32; 4
     p.extend_from_slice(xs);
     p.extend_from_slice(ps);
     p.extend(ring_v.iter().map(|&v| oc.vertex_pos(vk[v as usize])));
-    let x0: Vec<V3> = (0..nmov).map(|i| if i < nbv { oc.vertex_pos(bkeys[i]) } else if i >= 2 * nbv { p[i] } else { [0.0; 3] }).collect();
+    let x0: Vec<V3> = (0..nmov).map(|i| if i < nbv { oc.vertex_pos2(bkeys[i]) } else if i >= 2 * nbv { p[i] } else { [0.0; 3] }).collect();
     let mut fidx: Map<u32, u32> = Map::default();
     let mut cells: Vec<[u32; 8]> = hexq.iter().map(|h| [h[0], h[1], h[2], h[3], nbv as u32 + h[0], nbv as u32 + h[1], nbv as u32 + h[2], nbv as u32 + h[3]]).collect();
     let npil = cells.len();
@@ -896,7 +1049,7 @@ fn optimise(w: &Work, bvh: &Bvh, sf: &ShellField, bkeys: &[u64], hexq: &[[u32; 4
     let movable: Vec<bool> = (0..nmov)
         .map(|i| {
             if i < nbv {
-                opt.opt_core && !fixed[vk.binary_search(&bkeys[i]).unwrap_or(0)] && hloc[i].is_finite()
+                opt.opt_core && vidx(bkeys[i]).is_some_and(|j| !fixed[j]) && hloc[i].is_finite()
             } else if i < 2 * nbv {
                 true
             } else {
@@ -1029,6 +1182,7 @@ fn optimise(w: &Work, bvh: &Bvh, sf: &ShellField, bkeys: &[u64], hexq: &[[u32; 4
 /// Build the hex-core + pillow mesh from a shell-clipped, buffered octree (`Octree::build_clipped` with `Clip::Shell`).
 pub fn build(oc: &Octree, tris: &[Tri], opt: &Options) -> HexCore {
     let delta = oc.clip.delta().expect("hexcore needs an octree built with Clip::Shell");
+    assert!(!opt.graded_shell || oc.max_level <= 19, "graded_shell needs max_level <= 19 (doubled-lattice keys)");
     let mut st = HcStats::default();
     let t = Instant::now();
     let bvh = Bvh::new(tris);
@@ -1054,11 +1208,28 @@ pub fn build(oc: &Octree, tris: &[Tri], opt: &Options) -> HexCore {
     let mut core = vec![false; leaves.len()];
     let mut cmin = vec![0.0; leaves.len()];
     let mut vcount = vec![0u32; vk.len()];
+    // graded shell: the margin of a leaf is gamma times the size of the coarsest leaf in its 26-neighbourhood (and itself), so that the core
+    // boundary does not step by the size difference across a 2:1 transition of the surface size
+    let hm_of = |li: usize| -> f64 {
+        let l = &leaves[li];
+        let mut lvl = l.level;
+        if opt.graded_shell {
+            for d in 0..27i64 {
+                if d == 13 {
+                    continue;
+                }
+                if let Some(x) = oc.leaf_containing(l.level, l.i as i64 + d % 3 - 1, l.j as i64 + (d / 3) % 3 - 1, l.k as i64 + d / 9 - 1) {
+                    lvl = lvl.min(leaves[x].level);
+                }
+            }
+        }
+        oc.size / (1u64 << lvl) as f64
+    };
     for (li, l) in leaves.iter().enumerate() {
         let h = oc.leaf_size(l);
         let pmin = lv[li].iter().map(|&v| psi[v as usize]).fold(f64::INFINITY, f64::min);
         cmin[li] = pmin / h;
-        if pmin > opt.gamma * h {
+        if pmin > opt.gamma * hm_of(li) {
             core[li] = true;
             for &v in &lv[li] {
                 vcount[v as usize] += 1;
@@ -1070,7 +1241,7 @@ pub fn build(oc: &Octree, tris: &[Tri], opt: &Options) -> HexCore {
             st.removed_nonfluid += 1;
         }
     }
-    let mut w = Work { oc, sf: &sf, lv, core, vcount, cmin, cache: Map::default() };
+    let mut w = Work { oc, sf: &sf, lv, core, vcount, cmin, cache: Map::default(), graded: opt.graded_shell, qv: Map::default(), jset: Map::default() };
     st.t_core = t.elapsed().as_secs_f64();
 
     // --- cleanup rounds (manifold, normal) -> pillow hexes -> smoothing; pillow hexes whose min corner scaled Jacobian is
@@ -1087,7 +1258,7 @@ pub fn build(oc: &Octree, tris: &[Tri], opt: &Options) -> HexCore {
         let t = Instant::now();
         let mut bq = w.cleanup_manifold(&mut st);
         t_man += t.elapsed().as_secs_f64();
-        let (bq, g) = loop {
+        let (bq, mut g) = loop {
             let t = Instant::now();
             let g = w.geom_pass(&bq, opt);
             t_nrm += t.elapsed().as_secs_f64();
@@ -1133,9 +1304,9 @@ pub fn build(oc: &Octree, tris: &[Tri], opt: &Options) -> HexCore {
         let bkeys = g.keys.clone();
         let nbv = bkeys.len();
         st.core_boundary_verts = nbv;
-        let mut xs: Vec<V3> = bkeys.iter().map(|&k| oc.vertex_pos(k)).collect();
+        let mut xs: Vec<V3> = bkeys.iter().map(|&k| oc.vertex_pos2(k)).collect();
         let mut ps: Vec<V3> = g.tg.iter().map(|t| t.t).collect();
-        let hexq: Vec<[u32; 4]> = bq.iter().map(|q| q.key.map(|k| bkeys.binary_search(&k).unwrap() as u32)).collect();
+        let hexq: Vec<[u32; 4]> = g.sm.qb.iter().map(|q| q.key.map(|k| bkeys.binary_search(&k).unwrap() as u32)).collect();
         let mut inc: Vec<Vec<u32>> = vec![Vec::new(); nbv];
         let mut nbrs: Vec<Vec<u32>> = vec![Vec::new(); nbv];
         for (qi, h) in hexq.iter().enumerate() {
@@ -1223,6 +1394,8 @@ pub fn build(oc: &Octree, tris: &[Tri], opt: &Options) -> HexCore {
         let t_o = Instant::now();
         st.core_sj_min = 1.0;
         if opt.opt_sweeps > 0 {
+            w.jset = g.sm.jpairs.iter().map(|&p| (p, ())).collect();
+            w.refresh_qv();
             let r = optimise(&w, &bvh, &sf, &bkeys, &hexq, &g.hmax, &mut xs, &mut ps, opt);
             (st.opt_sweeps, st.moved_core_vertices, st.core_sj_min) = (r.sweeps, r.moved_core, r.core_sj_min);
         }
@@ -1269,7 +1442,7 @@ pub fn build(oc: &Octree, tris: &[Tri], opt: &Options) -> HexCore {
         t_smo += t.elapsed().as_secs_f64();
         let badq: Vec<usize> = (0..hexq.len()).filter(|&q| hex_min(&hexq[q], &xs, &ps) <= opt.sj_remove).collect();
         st.jacobian_violations_final = badq.len();
-        let out = (bq, bkeys, xs, ps, hexq, nbv);
+        let out = (std::mem::take(&mut g.sm), bkeys, xs, ps, hexq, nbv);
         // keep the best pass; a modification that does not reduce the number of bad hexes is undone
         let improved = best.as_ref().is_none_or(|b| badq.len() < b.1);
         if improved {
@@ -1289,13 +1462,13 @@ pub fn build(oc: &Octree, tris: &[Tri], opt: &Options) -> HexCore {
             break;
         }
         // modify around the bad hexes of the best pass: fill pinched margin-removed leaves (mode 1) or remove the owners (mode 0)
-        let (bo, bqs) = (&b.0, (0..b.0 .4.len()).filter(|&q| hex_min(&b.0 .4[q], &b.0 .2, &b.0 .3) <= opt.sj_remove).collect::<Vec<usize>>());
+        let (bo, bqs) = (&b.0 .0.qb, (0..b.0 .4.len()).filter(|&q| hex_min(&b.0 .4[q], &b.0 .2, &b.0 .3) <= opt.sj_remove).collect::<Vec<usize>>());
         let mut changed = false;
         for &q in &bqs {
             if mode == 0 {
-                st.removed_jacobian += w.remove(bo.0[q].leaf) as usize;
+                st.removed_jacobian += w.remove(bo[q].leaf) as usize;
             } else {
-                for k in bo.0[q].key {
+                for k in bo[q].key {
                     let mut f = Vec::new();
                     w.leaves_at_vertex(k, false, &mut f);
                     for l in f {
@@ -1314,12 +1487,25 @@ pub fn build(oc: &Octree, tris: &[Tri], opt: &Options) -> HexCore {
             st.post_budget_hit = true;
         }
     };
-    let (bq, bkeys, xs, ps, hexq, bn) = {
+    let (sm, bkeys, xs, ps, hexq, bn) = {
         let b = best.take().unwrap();
         (w.core, w.vcount, st) = (b.2, b.3, b.4);
         b.0
     };
     let _ = bn;
+    w.jset = sm.jpairs.iter().map(|&p| (p, ())).collect();
+    w.refresh_qv();
+    if let Some(sf_) = &sm.surf {
+        st.odd_faces = sm.tj.odd_faces;
+        st.tjoin_edges = sm.tj.n_j;
+        st.tjoin_max_path = sm.tj.max_path;
+        st.tpl_count = sm.q.tpl_count;
+        st.shell_faces = sf_.faces.len();
+        let mut hs: Vec<u64> = sf_.faces.iter().map(|f| f.h.to_bits()).collect();
+        hs.sort_unstable();
+        hs.dedup();
+        st.shell_levels = hs.len();
+    }
     st.post_rounds = post;
     st.t_manifold = t_man;
     st.t_normal = t_nrm;
@@ -1352,6 +1538,17 @@ pub fn build(oc: &Octree, tris: &[Tri], opt: &Options) -> HexCore {
     let t = Instant::now();
     let mut asm = Asm { oc, pts: Vec::new(), pmap: Map::default(), faces: Vec::new(), fmap: Map::default(), nonmanifold: 0 };
     let mut cells: Vec<Cell> = Vec::with_capacity(st.core_cells + hexq.len());
+    // boundary faces with a non-empty split mask are emitted as their template sub-quads (key: sorted corner keys)
+    let mut bmask: Map<[u64; 4], u32> = Map::default();
+    if let Some(sf_) = &sm.surf {
+        for (fi, f) in sf_.faces.iter().enumerate() {
+            if sm.tj.mask[fi] != 0 {
+                let mut k = f.key;
+                k.sort_unstable();
+                bmask.insert(k, fi as u32);
+            }
+        }
+    }
     for li in 0..leaves.len() {
         if !w.core[li] {
             continue;
@@ -1361,29 +1558,47 @@ pub fn build(oc: &Octree, tris: &[Tri], opt: &Options) -> HexCore {
         let coord = |n: usize| [base[0] + e * (n as u32 & 1), base[1] + e * ((n as u32 >> 1) & 1), base[2] + e * ((n as u32 >> 2) & 1)];
         let ci = cells.len() as u32;
         let mut fl: Vec<u32> = Vec::with_capacity(6);
+        let mut trans = false;
         for a in 0..3 {
             for s in 0..2 {
                 let r = ring(a, s);
                 let lat: [[u32; 3]; 4] = std::array::from_fn(|t| coord(r[t]));
                 let nb = w.neighbour(&l, a, s);
-                let (tag, quads): (u8, Vec<[[u32; 3]; 4]>) = match nb {
-                    None => (T_FAR, vec![lat]),
+                // (tag, quads of the face with a flag "boundary face of the core")
+                let (tag, quads): (u8, Vec<([[u32; 3]; 4], bool)>) = match nb {
+                    None => (T_FAR, vec![(lat, false)]),
                     Some(x) if leaves[x].level > l.level => {
                         st.core_split_faces += 1;
-                        let m: [[u32; 3]; 4] = std::array::from_fn(|t| std::array::from_fn(|d| (lat[t][d] + lat[(t + 1) % 4][d]) / 2));
-                        let c: [u32; 3] = std::array::from_fn(|d| (lat[0][d] + lat[2][d]) / 2);
-                        (T_CUBE, vec![[lat[0], m[0], c, m[3]], [m[0], lat[1], m[1], c], [c, m[1], lat[2], m[2]], [m[3], c, m[2], lat[3]]])
-                    }
-                    _ => (T_CUBE, vec![lat]),
-                };
-                for q in quads {
-                    let mut ids: Vec<u32> = Vec::with_capacity(8);
-                    for t in 0..4 {
-                        ids.push(asm.lat_id(q[t]));
-                        if let Some(m) = w.mid(q[t], q[(t + 1) % 4]) {
-                            ids.push(asm.lat_id(m));
+                        let nc: [bool; 4] = w.sub_cells(&l, a, s).map(|x| !x.is_some_and(|x| w.core[x]));
+                        if opt.graded_shell && nc.iter().all(|&b| b) {
+                            (T_CUBE, vec![(lat, true)])
+                        } else {
+                            let q = face_quarters(&lat);
+                            (T_CUBE, (0..4).map(|t| (q[t], opt.graded_shell && nc[t])).collect())
                         }
                     }
+                    Some(x) => (T_CUBE, vec![(lat, !w.core[x])]),
+                };
+                for (q, bd) in quads {
+                    if bd && !bmask.is_empty() {
+                        // boundary face (or quarter face) with a non-empty split mask: its template quads
+                        let mut k = q.map(key2);
+                        k.sort_unstable();
+                        if let Some(&fi) = bmask.get(&k) {
+                            trans = true;
+                            for qi in sm.q.fq[fi as usize]..sm.q.fq[fi as usize + 1] {
+                                let ids: Vec<u32> = sm.q.quads[qi as usize].iter().map(|&v| asm.id2(sm.q.verts[v as usize])).collect();
+                                fl.push(asm.add_face(ids, T_CUBE, ci));
+                            }
+                            continue;
+                        }
+                    }
+                    let mut pk: Vec<u64> = Vec::with_capacity(8);
+                    for t in 0..4 {
+                        pk.push(key2(q[t]));
+                        w.edge_points(q[t], q[(t + 1) % 4], &mut pk, &mut trans);
+                    }
+                    let ids: Vec<u32> = pk.iter().map(|&k| asm.id2(k)).collect();
                     fl.push(asm.add_face(ids, tag, ci));
                 }
             }
@@ -1396,9 +1611,10 @@ pub fn build(oc: &Octree, tris: &[Tri], opt: &Options) -> HexCore {
         } else {
             st.core_poly += 1;
         }
+        st.transition_cells += trans as usize;
         cells.push(Cell { faces: fl, hex, h: oc.leaf_size(&l), cut: false, n_orig: 1 });
     }
-    let cid: Vec<u32> = bkeys.iter().map(|&k| asm.lat_id(crate::octree::vertex_coords(k))).collect();
+    let cid: Vec<u32> = bkeys.iter().map(|&k| asm.id2(k)).collect();
     let pid: Vec<u32> = ps
         .iter()
         .map(|&p| {
@@ -1423,7 +1639,7 @@ pub fn build(oc: &Octree, tris: &[Tri], opt: &Options) -> HexCore {
             asm.add_face(vec![pb[0], pb[1], pb[2], pb[3]], T_SHELL, ci),
         ];
         shell.mesh_face.push(fl[5]);
-        cells.push(Cell { faces: fl, hex: Some([ca[0], ca[1], ca[2], ca[3], pb[0], pb[1], pb[2], pb[3]]), h: bq[qi].h, cut: true, n_orig: 1 });
+        cells.push(Cell { faces: fl, hex: Some([ca[0], ca[1], ca[2], ca[3], pb[0], pb[1], pb[2], pb[3]]), h: sm.qb[qi].h, cut: true, n_orig: 1 });
     }
     let mut mesh = CutMesh { points: asm.pts, faces: asm.faces, cells, stats: Default::default(), patch_name: "shell", native: Default::default() };
     mesh.stats.leaves = leaves.len();
@@ -1543,6 +1759,317 @@ mod tests {
         let sz = std::fs::metadata(dir.join("shell_quads.bin")).unwrap().len() as usize;
         assert_eq!(sz, 8 + hc.shell.pts.len() * 76 + 8 + hc.shell.quads.len() * 16);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn cube_soup(c: V3, hx: V3) -> Vec<Tri> {
+        let mut t: Vec<Tri> = Vec::new();
+        for a in 0..3 {
+            for sd in 0..2 {
+                let r = ring(a, sd);
+                let p: Vec<V3> = r.iter().map(|&n| [c[0] + hx[0] * if n & 1 == 1 { 1.0 } else { -1.0 }, c[1] + hx[1] * if n & 2 == 2 { 1.0 } else { -1.0 }, c[2] + hx[2] * if n & 4 == 4 { 1.0 } else { -1.0 }]).collect();
+                t.push([p[0], p[1], p[2]]);
+                t.push([p[0], p[2], p[3]]);
+            }
+        }
+        t
+    }
+
+    /// Octree with a synthetic surface grading: triangles whose centroid satisfies `fine` get the surface size `fac * hs`.
+    fn graded_oc(tris: &[Tri], size: f64, lmax: u8, fac: f64, fine: &dyn Fn(V3) -> bool) -> (Octree, f64) {
+        let hs = size / (1u64 << lmax) as f64;
+        let delta = 4.0 * hs;
+        let mut sf = SizeField::new(hs, 0.3, size / 8.0);
+        sf.tri_h = Some(tris.iter().map(|t| if fine([(t[0][0] + t[1][0] + t[2][0]) / 3.0, (t[0][1] + t[1][1] + t[2][1]) / 3.0, (t[0][2] + t[1][2] + t[2][2]) / 3.0]) { hs * fac } else { hs }).collect());
+        let ll = lmax + (1.0 / fac).log2().ceil() as u8;
+        (Octree::build_clipped(tris, [-1.0; 3], size, ll, &sf, 0, SignMode::Dexel, Clip::Shell { delta }), delta)
+    }
+
+    /// Every cell is closed (directed face edges pair up with opposite orientation, face area vectors sum to zero), every internal
+    /// face has two cells.
+    fn assert_cells_closed(m: &CutMesh) {
+        for f in &m.faces {
+            assert_eq!(f.neigh == NONE, f.patch != INTERNAL, "internal face without neighbour");
+        }
+        for ci in 0..m.cells.len() {
+            let mut e: Map<(u32, u32), i32> = Map::default();
+            let (mut av, mut sc) = ([0.0; 3], 0.0);
+            for p in m.cell_polys(ci) {
+                for t in 0..p.len() {
+                    let (a, b) = (p[t], p[(t + 1) % p.len()]);
+                    *e.entry((a.min(b), a.max(b))).or_insert(0) += if a < b { 1 } else { -1 };
+                }
+                // area vector of the polygon (triangle fan about the first vertex)
+                let p0 = m.points[p[0] as usize];
+                for t in 1..p.len() - 1 {
+                    let n = cross(sub(m.points[p[t] as usize], p0), sub(m.points[p[t + 1] as usize], p0));
+                    av = add(av, scale(n, 0.5));
+                    sc += norm(n) * 0.5;
+                }
+            }
+            assert!(e.values().all(|&v| v == 0), "cell {ci} not closed");
+            assert!(norm(av) < 1e-9 * sc.max(1e-300), "cell {ci}: face area vectors sum to {}", norm(av) / sc);
+        }
+    }
+
+    /// Check a shell mesh of a boundary face set: Q closed except along the domain box, conforming, same Euler characteristic and
+    /// same area as P (exact lattice integers).
+    fn assert_shell_valid(sm: &ShellMesh, ml: u8) {
+        let surf = sm.surf.as_ref().unwrap();
+        assert!(sm.tj.unmatched.is_empty());
+        assert!(sm.tj.mask.iter().all(|m| m.count_ones() % 2 == 0));
+        let top = 2u32 << ml;
+        let on_box = |a: u64, b: u64| {
+            let (ca, cb) = (vertex_coords(a), vertex_coords(b));
+            (0..3).any(|d| ca[d] == cb[d] && (ca[d] == 0 || ca[d] == top))
+        };
+        // P: only open edges on the box, nothing non-manifold
+        let mc = surf.manifold_check();
+        assert!(mc.nm_edges.is_empty() && mc.nm_verts == 0, "P not manifold");
+        for e in &surf.edges {
+            assert!(e.n == 2 || on_box(e.a, e.b), "open edge of P off the box");
+        }
+        // Q edges
+        let q = &sm.q;
+        let mut uses: Map<(u32, u32), (usize, i32)> = Map::default();
+        for qd in &q.quads {
+            for t in 0..4 {
+                let (a, b) = (qd[t], qd[(t + 1) % 4]);
+                let u = uses.entry((a.min(b), a.max(b))).or_insert((0, 0));
+                u.0 += 1;
+                u.1 += if a < b { 1 } else { -1 };
+            }
+        }
+        for (&(a, b), &(n, d)) in &uses {
+            if n == 2 {
+                assert_eq!(d, 0, "Q edge used twice with the same orientation");
+            } else {
+                assert!(n == 1 && on_box(q.verts[a as usize], q.verts[b as usize]), "Q edge used {n} times off the box");
+            }
+        }
+        // Euler characteristic
+        let mut pv: Vec<u64> = surf.faces.iter().flat_map(|f| f.polygon().0[..f.polygon().1].to_vec()).collect();
+        pv.sort_unstable();
+        pv.dedup();
+        let chi_p = pv.len() as i64 - surf.edges.len() as i64 + surf.faces.len() as i64;
+        let chi_q = q.verts.len() as i64 - uses.len() as i64 + q.quads.len() as i64;
+        assert_eq!(chi_p, chi_q, "chi(P) != chi(Q)");
+        // area in doubled lattice units: sum over faces of |area vector|, exact in i64 (planar axis-aligned faces)
+        let av = |k: [u64; 4]| -> i64 {
+            let c: Vec<[i64; 3]> = k.iter().map(|&x| vertex_coords(x).map(|v| v as i64)).collect();
+            let (d02, d13) = ([c[2][0] - c[0][0], c[2][1] - c[0][1], c[2][2] - c[0][2]], [c[3][0] - c[1][0], c[3][1] - c[1][1], c[3][2] - c[1][2]]);
+            let n = [d02[1] * d13[2] - d02[2] * d13[1], d02[2] * d13[0] - d02[0] * d13[2], d02[0] * d13[1] - d02[1] * d13[0]];
+            n.iter().map(|x| x.abs()).sum()
+        };
+        let ap: i64 = surf.faces.iter().map(|f| av(f.key)).sum();
+        let aq: i64 = q.quads.iter().map(|qd| av(qd.map(|v| q.verts[v as usize]))).sum();
+        assert_eq!(ap, aq, "area(P) != area(Q)");
+    }
+
+    /// Leaves of a random balanced octree, core = superlevel set of random Gaussians, a `Work` on it (dummy shell field).
+    fn random_work_trial<R>(seed: u64, f: impl FnOnce(&mut Work, &Octree) -> R) -> R {
+        let mut st = seed.wrapping_mul(0x9e3779b97f4a7c15) | 1;
+        let mut rnd = move || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            (st >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let ml = 4u8;
+        let n = 1 << ml;
+        let nseed = 2 + (rnd() * 4.0) as usize;
+        let seeds: Vec<[f64; 3]> = (0..nseed).map(|_| [rnd() * n as f64, rnd() * n as f64, rnd() * n as f64]).collect();
+        let oc = Octree::from_refinement([0.0; 3], n as f64, ml, 1, &|l, i, j, k| {
+            let sc = (1u32 << (ml - l)) as f64;
+            let c = [(i as f64 + 0.5) * sc, (j as f64 + 0.5) * sc, (k as f64 + 0.5) * sc];
+            seeds.iter().any(|s| (0..3).map(|d| (c[d] - s[d]).powi(2)).sum::<f64>().sqrt() < 1.2 * sc + 2.0)
+        });
+        assert_eq!(oc.balance_violations(), 0);
+        let ng = 1 + (rnd() * 3.0) as usize;
+        let gs: Vec<([f64; 3], f64, f64)> = (0..ng).map(|_| ([rnd() * n as f64, rnd() * n as f64, rnd() * n as f64], 1.0 + 2.5 * rnd(), 0.6 + 0.8 * rnd())).collect();
+        let thr = 0.35 + 0.3 * rnd();
+        let bvh = Bvh::new(&[[[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]]);
+        let sf = ShellField::offset(&bvh, 1.0);
+        let (leaves, vk) = (oc.leaves(), oc.vertices());
+        let lv: Vec<[u32; 8]> = (0..leaves.len())
+            .map(|li| {
+                let (b, e) = geom(&leaves[li], ml);
+                std::array::from_fn(|q| vk.binary_search(&vertex_key(b[0] + e * (q as u32 & 1), b[1] + e * ((q as u32 >> 1) & 1), b[2] + e * ((q as u32 >> 2) & 1))).unwrap() as u32)
+            })
+            .collect();
+        let mut core = vec![false; leaves.len()];
+        let mut vcount = vec![0u32; vk.len()];
+        for (li, l) in leaves.iter().enumerate() {
+            let c = oc.leaf_centre(l);
+            let v: f64 = gs.iter().map(|(g, s, a)| a * (-(0..3).map(|d| (c[d] - g[d]).powi(2)).sum::<f64>() / (2.0 * s * s)).exp()).sum();
+            if v > thr {
+                core[li] = true;
+                for &x in &lv[li] {
+                    vcount[x as usize] += 1;
+                }
+            }
+        }
+        let mut w = Work { oc: &oc, sf: &sf, lv, core, vcount, cmin: vec![0.0; leaves.len()], cache: Map::default(), graded: true, qv: Map::default(), jset: Map::default() };
+        f(&mut w, &oc)
+    }
+
+    #[test]
+    fn tjoin_random_balanced() {
+        let (mut n_odd, mut n_j, mut n_trials, mut n_open, mut max_path, mut n_hang_pts) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        for seed in 1..=400u64 {
+            random_work_trial(seed, |w, oc| {
+                let mut st = HcStats::default();
+                let bq = w.cleanup_manifold(&mut st);
+                if bq.is_empty() {
+                    return;
+                }
+                n_trials += 1;
+                assert_eq!(st.removed_hanging, 0);
+                assert_eq!(st.removed_parity, 0, "seed {seed}: Theorem 1 violated (odd component without partner)");
+                let sm = w.shell_mesh(&bq);
+                assert_shell_valid(&sm, oc.max_level);
+                let surf = sm.surf.as_ref().unwrap();
+                n_odd += sm.tj.odd_faces;
+                n_j += sm.tj.n_j;
+                max_path = max_path.max(sm.tj.max_path);
+                n_open += surf.edges.iter().filter(|e| e.n == 1).count();
+                // Lemma F: the fine-side half edges of a hanging point lie in one component of the full-edge graph
+                let comp = surf.ff_components();
+                let mut fans: Map<u64, Vec<u32>> = Map::default();
+                for e in &surf.edges {
+                    if e.kind() == crate::surfq::EKind::HF {
+                        let (fine, coarse) = if e.half[0] { (e.f[1], e.f[0]) } else { (e.f[0], e.f[1]) };
+                        let cf = &surf.faces[coarse as usize];
+                        let m = (0..4).filter(|&t| cf.hang >> t & 1 == 1).map(|t| crate::surfq::mid_key(cf.key[t], cf.key[(t + 1) % 4])).find(|&m| m == e.a || m == e.b).unwrap();
+                        fans.entry(m).or_default().push(fine);
+                    }
+                }
+                n_hang_pts += fans.len();
+                for (m, fs) in &fans {
+                    assert!(fs.iter().all(|&f| comp[f as usize] == comp[fs[0] as usize]), "seed {seed}: Lemma F fails at hanging point {m}");
+                }
+                // identical result when run twice (determinism)
+                let sm2 = w.shell_mesh(&bq);
+                assert_eq!(sm.tj.mask, sm2.tj.mask);
+                assert_eq!(sm.q.verts, sm2.q.verts);
+            });
+        }
+        println!("tjoin_random: {n_trials} trials, odd faces {n_odd}, J edges {n_j} (max path {max_path}), open edges {n_open}, hanging points {n_hang_pts}");
+        assert!(n_trials >= 300, "only {n_trials} usable trials");
+        assert!(n_odd > 0 && n_j > 0 && n_hang_pts > 0, "random sets never produced odd faces");
+    }
+
+    #[test]
+    fn qmesh_closed() {
+        // cores strictly inside the box: Q (and P) have no open edge at all
+        let mut tried = 0;
+        for seed in 1000..1400u64 {
+            random_work_trial(seed, |w, oc| {
+                // keep only leaves whose closed box is at distance >= 1 lattice unit from the domain box
+                let top = (1u32 << oc.max_level) as i64;
+                for li in 0..oc.leaves().len() {
+                    if w.core[li] {
+                        let (b, e) = geom(&oc.leaves()[li], oc.max_level);
+                        if (0..3).any(|d| (b[d] as i64) < 1 || b[d] as i64 + e as i64 > top - 1) {
+                            w.remove(li as u32);
+                        }
+                    }
+                }
+                let mut st = HcStats::default();
+                let bq = w.cleanup_manifold(&mut st);
+                if bq.is_empty() {
+                    return;
+                }
+                let sm = w.shell_mesh(&bq);
+                assert_shell_valid(&sm, oc.max_level);
+                let surf = sm.surf.as_ref().unwrap();
+                assert!(surf.edges.iter().all(|e| e.n == 2), "open edge in the closed case");
+                let mut uses: Map<(u32, u32), usize> = Map::default();
+                for qd in &sm.q.quads {
+                    for t in 0..4 {
+                        let (a, b) = (qd[t], qd[(t + 1) % 4]);
+                        *uses.entry((a.min(b), a.max(b))).or_insert(0) += 1;
+                    }
+                }
+                assert!(uses.values().all(|&n| n == 2), "Q edge not used exactly twice");
+                tried += 1;
+            });
+        }
+        assert!(tried >= 200, "only {tried} closed trials");
+    }
+
+    fn assert_same_stats(a: &HexCore, b: &HexCore) {
+        let (x, y) = (&a.stats, &b.stats);
+        assert_eq!((x.leaves, x.core_cells, x.core_boundary_quads, x.pillow_hexes, x.core_hex, x.core_poly, x.removed_hanging, x.removed_split), (y.leaves, y.core_cells, y.core_boundary_quads, y.pillow_hexes, y.core_hex, y.core_poly, y.removed_hanging, y.removed_split));
+        assert_eq!((x.sj_min_after.to_bits(), x.sj_mean.to_bits(), x.sj_min_before.to_bits(), x.n_sj_below_0p3), (y.sj_min_after.to_bits(), y.sj_mean.to_bits(), y.sj_min_before.to_bits(), y.n_sj_below_0p3));
+        assert_eq!((a.mesh.cells.len(), a.mesh.faces.len(), a.mesh.points.len()), (b.mesh.cells.len(), b.mesh.faces.len(), b.mesh.points.len()));
+        assert!(a.mesh.points.iter().zip(&b.mesh.points).all(|(p, q)| p.iter().zip(q).all(|(u, v)| u.to_bits() == v.to_bits())), "points differ");
+        assert_eq!((y.odd_faces, y.tjoin_edges, y.transition_cells), (0, 0, 0));
+    }
+
+    #[test]
+    fn uniform_identity() {
+        // uniform shell level: no hanging vertices, no odd faces; graded_shell on must reproduce the default result bit for bit
+        let size = 2.0;
+        let hs = size / 32.0;
+        let delta = 4.0 * hs;
+        for tris in [sphere([0.05, 0.02, -0.03], 0.5), cube_soup([0.03, -0.02, 0.01], [0.45, 0.45, 0.45])] {
+            let oc = Octree::build_clipped(&tris, [-1.0; 3], size, 5, &SizeField::new(hs, 0.3, size / 8.0), 0, SignMode::Dexel, Clip::Shell { delta });
+            let off = build(&oc, &tris, &Options { delta, ..Options::default() });
+            let on = build(&oc, &tris, &Options { delta, graded_shell: true, ..Options::default() });
+            assert_same_stats(&off, &on);
+            assert_eq!(off.mesh.stats.n_nonpositive_cells, 0);
+        }
+    }
+
+    fn check_graded(name: &str, tris: &[Tri], oc: &Octree, delta: f64, sj_bar: f64) -> HexCore {
+        assert_eq!(oc.balance_violations(), 0);
+        let t0 = Instant::now();
+        let o = Options { delta, graded_shell: true, ..Options::default() };
+        let hc = build(oc, tris, &o);
+        eprintln!("{name}: graded build {:.1}s (opt {:.1}s, rounds {}, post {})", t0.elapsed().as_secs_f64(), hc.stats.t_opt, hc.stats.rounds, hc.stats.post_rounds);
+        let (s, m) = (&hc.stats, &hc.mesh);
+        println!(
+            "{name}: unprojected {} stage init/smooth/opt {:.3} {:.3} {:.3} | leaves/level {:?} | core {} hang {} split {} parity {} faces P {} levels {} odd {} J {} (path {}) tpl {:?} trans {} pillow {} sj {:.3}->{:.3} <0.3: {} core_sj {:.3}",
+            s.unprojected, s.stage_initial.min, s.stage_smooth.min, s.stage_opt.min, oc.leaves_per_level(), s.core_cells, s.removed_hanging, s.removed_split, s.removed_parity, s.shell_faces, s.shell_levels, s.odd_faces, s.tjoin_edges, s.tjoin_max_path, s.tpl_count, s.transition_cells, s.pillow_hexes, s.sj_min_before, s.sj_min_after, s.n_sj_below_0p3, s.core_sj_min
+        );
+        assert_eq!(s.removed_hanging, 0);
+        assert!(s.shell_levels >= 2, "no graded shell");
+        assert!(s.odd_faces > 0 && s.tjoin_edges > 0, "no transition parity work");
+        assert_eq!(s.removed_parity, 0);
+        assert_eq!((s.nonmanifold_edges_final, s.nonmanifold_verts_final, s.open_edges), (0, 0, 0));
+        assert!(s.sj_min_after >= sj_bar, "pillow sj min {} < {sj_bar}", s.sj_min_after);
+        assert_eq!((m.stats.n_nonpositive_cells, m.stats.orphan_faces, m.stats.nonmanifold_faces), (0, 0, 0));
+        assert_cells_closed(m);
+        assert_eq!(m.faces.iter().filter(|f| f.patch == WALL).count(), s.pillow_hexes);
+        let bvh = Bvh::new(tris);
+        // all pillow tops lie on the shell except the vertices moved off it by the last-resort Jacobian repair
+        let off_shell = hc.shell.pts.iter().filter(|p| (bvh.closest(**p).0 - delta).abs() >= 1e-9 * oc.size).count();
+        assert!(off_shell <= s.unprojected, "{off_shell} vertices off the shell, {} unprojected", s.unprojected);
+        let dir = std::env::temp_dir().join(format!("rcore_graded_{name}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s2 = crate::su2::write_su2(m, &dir.join("mesh.su2")).unwrap();
+        assert_eq!(s2.nonpositive, 0, "SU2 decomposition has non-positive elements");
+        std::fs::remove_dir_all(&dir).unwrap();
+        hc
+    }
+
+    #[test]
+    fn sphere_graded() {
+        let (c, r, size) = ([0.05, 0.02, -0.03], 0.5, 2.0);
+        let tris = sphere(c, r);
+        let (oc, delta) = graded_oc(&tris, size, 5, 0.5, &|p| p[2] > 0.0);
+        // pillow quality bar of the design (SJ >= 0.3) is not met yet: the transition rows (Tc templates, 45 degree corners, thin
+        // pillow at the 2:1 cliff) stay at SJ ~ 0.02; here only a positive Jacobian is required (S5: quarter-face cost tuning)
+        let hc = check_graded("sphere", &tris, &oc, delta, 0.0);
+        assert!(hc.stats.transition_cells > 0);
+    }
+
+    #[test]
+    fn box_graded() {
+        // one fine face (+x): the fronts of the fine and coarse faces meet over convex edges and corners
+        let tris = cube_soup([0.0, 0.0, 0.0], [0.4, 0.3, 0.25]);
+        let (oc, delta) = graded_oc(&tris, 2.0, 5, 0.5, &|p| p[0] > 0.39);
+        check_graded("box", &tris, &oc, delta, 0.3);
     }
 
     #[test]
