@@ -33,6 +33,8 @@ pub struct MeshSpec {
     pub hg_k: f64,
     /// see `LayerOptions::feature_angle` (degrees, 0 = off)
     pub feature_angle: f64,
+    /// see `LayerOptions::edge_nodes`
+    pub edge_nodes: bool,
     /// smoothing sweeps; negative = default (25 harmonic, 0 nearest)
     pub smooth: i64,
     pub write_foam: bool,
@@ -46,7 +48,7 @@ pub struct MeshSpec {
 
 impl Default for MeshSpec {
     fn default() -> Self {
-        MeshSpec { origin: [0.0; 3], size: 1.0, lmax: 6, h_surf: 0.0, grade: 0.2, h_max: f64::INFINITY, delta: -1.0, mode: SignMode::Dexel, opt: Options::default(), nlayers: 0, dy0: -1.0, growth: 1.25, snap: 0.4, repair_sj: 0.05, features: false, cont: 0, cont_rings: 3, zip: false, columns: Columns::Harmonic, hg_k: 8.0, feature_angle: 0.0, smooth: -1, write_foam: true, write_su2: true, write_shell_quads: false, curvature: false, curv: CurvOptions::default(), extra_levels: 3 }
+        MeshSpec { origin: [0.0; 3], size: 1.0, lmax: 6, h_surf: 0.0, grade: 0.2, h_max: f64::INFINITY, delta: -1.0, mode: SignMode::Dexel, opt: Options::default(), nlayers: 0, dy0: -1.0, growth: 1.25, snap: 0.4, repair_sj: 0.05, features: false, cont: 0, cont_rings: 3, zip: false, columns: Columns::Harmonic, hg_k: 8.0, feature_angle: 0.0, edge_nodes: false, smooth: -1, write_foam: true, write_su2: true, write_shell_quads: false, curvature: false, curv: CurvOptions::default(), extra_levels: 3 }
     }
 }
 
@@ -141,7 +143,7 @@ pub fn run_with(tris: &[Tri], spec: &MeshSpec, out: &Path, geom: Option<&crate::
         if dy0 <= 0.0 {
             dy0 = layers::fit_dy0(delta, nlayers, growth);
         }
-        layers::build(&hc, tris, &LayerOptions { features: spec.features, cont: spec.cont, cont_rings: spec.cont_rings, zip: spec.zip, n: nlayers, dy0, growth, snap: spec.snap, repair_sj: spec.repair_sj, columns, hg_k: spec.hg_k, feature_angle: spec.feature_angle, smooth_sweeps: if spec.smooth >= 0 { spec.smooth as usize } else if columns == Columns::Harmonic { 25 } else { 0 } })
+        layers::build(&hc, tris, &LayerOptions { features: spec.features, cont: spec.cont, cont_rings: spec.cont_rings, zip: spec.zip, n: nlayers, dy0, growth, snap: spec.snap, repair_sj: spec.repair_sj, columns, hg_k: spec.hg_k, feature_angle: spec.feature_angle, edge_nodes: spec.edge_nodes, smooth_sweeps: if spec.smooth >= 0 { spec.smooth as usize } else if columns == Columns::Harmonic { 25 } else { 0 } })
     });
     let t_layers = t.elapsed().as_secs_f64();
     let (m, s) = (lm.as_ref().map_or(&hc.mesh, |l| &l.mesh), &hc.stats);
@@ -171,7 +173,7 @@ pub fn run_with(tris: &[Tri], spec: &MeshSpec, out: &Path, geom: Option<&crate::
     let t_foam = t.elapsed().as_secs_f64();
     let t = Instant::now();
     let lbad: &[([f64; 3], usize, f64)] = lm.as_ref().map_or(&[], |l| &l.stats.bad_cells);
-    let mesh = crate::report::analyze_mesh(m, &crate::report::Locate { tris, geom, h_surf, delta, nlayers, growth: lm.as_ref().map_or(growth, |l| 0.5 * (l.stats.growth_min + l.stats.growth_max)), n_core: s.core_cells, n_pillow: s.pillow_hexes, layer_bad: lbad });
+    let mesh = crate::report::analyze_mesh(m, &crate::report::Locate { tris, geom, h_surf, delta, nlayers, growth: lm.as_ref().map_or(growth, |l| 0.5 * (l.stats.growth_min + l.stats.growth_max)), n_core: s.core_cells, n_pillow: s.pillow_hexes, layer_bad: lbad, cell_layer: lm.as_ref().map_or(&[], |l| &l.cell_layer) });
     if spec.write_foam {
         crate::report::write_cellset(out, &mesh.bad_cells).map_err(io)?;
     }

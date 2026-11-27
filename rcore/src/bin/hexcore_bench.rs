@@ -43,6 +43,7 @@ fn main() {
     let mut cont_rings = 3usize;
     let mut zip_on = false;
     let mut feature_angle = 0.0f64;
+    let mut edge_nodes = false;
     let (mut curvature, mut curv_c) = (false, 0.25f64);
     let (mut columns, mut hg_k, mut smooth) = (Columns::Harmonic, 8.0f64, -1i64);
     for a in &args[2..args.len() - 1] {
@@ -55,6 +56,7 @@ fn main() {
             "size" => size = v.parse().unwrap(),
             "L" => lmax = v.parse().unwrap(),
             "h_surf" => h_surf = v.parse().unwrap(),
+            "edge_nodes" => edge_nodes = v == "1",
             "curvature" => curvature = v == "1",
             "curv_c" => curv_c = v.parse().unwrap(),
             "grade" => grade = v.parse().unwrap(),
@@ -106,7 +108,7 @@ fn main() {
             _ => panic!("unknown key {k}"),
         }
     }
-    let spec = MeshSpec { origin, size, lmax, h_surf, grade, h_max, delta, mode, opt, nlayers, dy0, growth, snap, repair_sj, features: features_on, cont: cont_mode, cont_rings, zip: zip_on, columns, hg_k, feature_angle, smooth, write_foam: true, write_su2: true, write_shell_quads: true, curvature, curv: rcore::sizing::CurvOptions { c: curv_c, ..Default::default() }, extra_levels: 3 };
+    let spec = MeshSpec { origin, size, lmax, h_surf, grade, h_max, delta, mode, opt, nlayers, dy0, growth, snap, repair_sj, features: features_on, cont: cont_mode, cont_rings, zip: zip_on, columns, hg_k, feature_angle, edge_nodes, smooth, write_foam: true, write_su2: true, write_shell_quads: true, curvature, curv: rcore::sizing::CurvOptions { c: curv_c, ..Default::default() }, extra_levels: 3 };
     match pipeline::run(&tris, &spec, &out) {
         Ok(r) => println!("{}", r.json),
         Err(e) => {

@@ -17,13 +17,14 @@ usage: mantle INPUT.stl -o CASE_DIR [options]
   --dy0 D              first cell height, absolute (overrides --yplus/--re)
   --layers N           boundary layers (default 12; raised automatically, max 60, if dy0 needs growth > 1.3)
   --growth G           layer growth ratio (default 1.2)
-  --delta D            layer / shell thickness (default 4 h_surf)
+  --delta D            layer / shell thickness (default 4 h_surf; caps h_surf at delta/2 when --h-surf is not given)
   --preset P           coarse | medium | fine: h_surf = length / 32 | 48 | 80 (default medium; explicit flags override)
   --h-surf H           surface cell size (default bbox length / preset divisor)
   --farfield F         domain side = F * bbox length, cube centred on the body (default 5)
   --level L            octree depth (default: smallest with side/2^L <= h_surf)
   --fillet F           shell fillet radius at concave creases, in units of delta (default 1.0; 0 = plain offset)
   --feature-angle DEG  wall-node fans only at edges sharper than this (default 25; shallower facet edges are treated as smooth)
+  --edge-nodes on|off  structured fans: wall nodes of columns on sharp convex edges from a 1D discretisation of the edge curve (experimental, default off = cluster feet by proximity)
   --curvature on|off   curvature-based surface sizing: h = clamp(c R, h_min, h_surf) per triangle (default OFF, experimental: the hex core / pillow needs one uniform shell level, so size transitions on the shell break it, see README of the sizing module); sharp edges (dihedral > 60 deg) are ignored
   --curv-c C           cells per radius of curvature, h = C R (default 0.25, ~25 cells per circle)
   --h-min H            smallest surface size (default h_surf / 8; the octree gets at most 3 extra levels)
@@ -55,6 +56,7 @@ struct Cli {
     level: Option<u8>,
     fillet: f64,
     angle: f64,
+    edge_nodes: bool,
     curvature: bool,
     curv_c: f64,
     h_min: Option<f64>,
@@ -67,7 +69,7 @@ struct Cli {
 }
 
 fn parse_args(args: &[String]) -> Result<Option<Cli>, String> {
-    let mut c = Cli { input: PathBuf::new(), out: PathBuf::new(), yplus: None, re: None, dy0: None, layers: None, growth: 1.2, delta: None, h_surf: None, farfield: 5.0, preset: "medium".into(), level: None, fillet: 1.0, angle: 25.0, curvature: false, curv_c: 0.25, h_min: None, su2: true, foam: true, quiet: false, json: false, force: false, report_only: false };
+    let mut c = Cli { input: PathBuf::new(), out: PathBuf::new(), yplus: None, re: None, dy0: None, layers: None, growth: 1.2, delta: None, h_surf: None, farfield: 5.0, preset: "medium".into(), level: None, fillet: 1.0, angle: 25.0, edge_nodes: false, curvature: false, curv_c: 0.25, h_min: None, su2: true, foam: true, quiet: false, json: false, force: false, report_only: false };
     let (mut have_in, mut have_out) = (false, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -88,6 +90,7 @@ fn parse_args(args: &[String]) -> Result<Option<Cli>, String> {
             "--level" => c.level = Some(val("L")?.parse().ok().filter(|l| (1..=16).contains(l)).ok_or("--level: integer 1..16")?),
             "--fillet" => c.fillet = num(val("F")?, a)?,
             "--feature-angle" => c.angle = num(val("DEG")?, a)?,
+            "--edge-nodes" => c.edge_nodes = match val("on|off")?.as_str() { "on" => true, "off" => false, o => return Err(format!("--edge-nodes: on|off, got '{o}'")) },
             "--curvature" => c.curvature = match val("on|off")?.as_str() { "on" => true, "off" => false, o => return Err(format!("--curvature: on|off, got '{o}'")) },
             "--curv-c" => c.curv_c = num(val("C")?, a)?,
             "--h-min" => c.h_min = Some(num(val("H")?, a)?),
@@ -218,6 +221,13 @@ fn run(c: &Cli) -> Result<(), String> {
     } else if delta > 0.5 * tscale && !c.quiet && !c.json {
         eprintln!("warning: delta {delta:.3e} > 0.5 x thickness scale {tscale:.3e}: thin parts may produce an invalid shell");
     }
+    // the shell must span at least two surface cells: an explicit --delta without --h-surf caps the surface size, like the thin-body rule
+    if c.delta.is_some() && c.h_surf.is_none() && h_surf > 0.5 * delta {
+        h_surf = 0.5 * delta;
+        cap = format!("h_surf {h_surf:.4e} (= delta/2) from the explicit --delta, so the layer shell spans at least two surface cells");
+    } else if c.delta.is_some() && c.h_surf.is_some() && delta < 2.0 * h_surf && !c.quiet && !c.json {
+        eprintln!("warning: delta {delta:.3e} < 2 x h_surf {h_surf:.3e}: the layer shell is thinner than two surface cells; expect a poor hex core / pillow layer");
+    }
     let sizing = checks::sizing_findings(&geom, &tris, h_surf, delta);
     if c.report_only {
         let md = report::input_markdown(&input, &geom, Some(&sizing));
@@ -276,6 +286,7 @@ fn run(c: &Cli) -> Result<(), String> {
         dy0: dy0_req.unwrap_or(-1.0),
         growth: c.growth,
         feature_angle: c.angle,
+        edge_nodes: c.edge_nodes,
         curvature: c.curvature,
         curv: CurvOptions { c: c.curv_c, h_min: c.h_min.unwrap_or(0.0), ..CurvOptions::default() },
         write_foam: c.foam,

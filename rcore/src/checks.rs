@@ -600,7 +600,7 @@ pub fn sizing_findings(g: &Geometry, tris: &[Tri], h_surf: f64, delta: f64) -> V
             ),
             pick_examples(cand, sep, 5),
             "Fewer than about one surface cell per radius cannot follow the round edge; the shell and layer columns bunch up there and the first cells get skewed.",
-            &format!("Use --h-surf {sug:.3e}{preset}, or accept it if the edge region is not critical (note: refining raises the cell count roughly with 1/h^2)."),
+            &format!("Accept it if the nose region is not critical, or round / resolve the nose in CAD. A finer surface size (--h-surf {sug:.3e}{preset}) may help, but this has not been validated to remove the cell defects at such an edge, and refining raises the cell count roughly with 1/h^2."),
         ));
     } else {
         let tight: Vec<usize> = (0..nt).filter(|&i| g.tri_r[i] < 2.0 * h_surf).collect();
@@ -614,7 +614,7 @@ pub fn sizing_findings(g: &Geometry, tris: &[Tri], h_surf: f64, delta: f64) -> V
                 format!("Convex radius of curvature down to {:.3e} is only {:.1}x the surface cell size {:.3e}", rmin, rmin / h_surf, h_surf),
                 pick_examples(cand, sep, 5),
                 "About two surface cells per radius: acceptable for most cases, but the curved region is resolved coarsely.",
-                "Use a finer --h-surf if the flow around this edge matters.",
+                "A finer --h-surf may resolve this edge better if the flow around it matters (not validated for the layer cells there).",
             ));
         }
     }
@@ -638,7 +638,7 @@ pub fn sizing_findings(g: &Geometry, tris: &[Tri], h_surf: f64, delta: f64) -> V
             ),
             pick_examples(cand, sep, 5),
             "The layer stack there is several times thicker than the body itself, so the layers from the two sides meet at the thin edge and its cells are squeezed or sheared; this is where the worst cells of thin wings usually are.",
-            &format!("Reduce --delta (the thinnest part you want layered is about delta/4; try {:.2e}) or use fewer / thinner layers (--dy0, --layers); a sharp trailing edge is always thinner than delta near its tip, so a small remainder is expected.", sig1(0.5 * delta)),
+            "Known limitation at thin sharp edges (see the README): a few skewed cells at a sharp trailing edge are expected with the current version, and the automatic sizing is the most robust setting we have tested (a smaller --delta or finer --h-surf did not remove them on the ONERA M6). A slightly blunt trailing edge in CAD avoids them.",
         ));
     }
     // 3. narrow gaps between facing surfaces vs 2 delta

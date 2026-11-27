@@ -78,6 +78,8 @@ pub struct Locate<'a> {
     pub n_pillow: usize,
     /// (wall foot, layer index, scaled Jacobian) of non-positive layer cells from the layer statistics
     pub layer_bad: &'a [(V3, usize, f64)],
+    /// layer index (1-based) of every layer cell, in cell order after the core / pillow cells (`layers::LayerMesh::cell_layer`)
+    pub cell_layer: &'a [u8],
 }
 
 pub fn stage_of(c: usize, n_core: usize, n_pillow: usize) -> Stage {
@@ -242,8 +244,7 @@ pub fn analyze_mesh(m: &CutMesh, lc: &Locate) -> MeshReport {
                 Stage::Pillow => cl.n_pillow += 1,
                 Stage::Layer => {
                     cl.n_layer += 1;
-                    let d = bvh.closest(cd.centre[ci]).0;
-                    let k = layer_index(d, lc.delta, lc.nlayers.max(1), lc.growth);
+                    let k = lc.cell_layer.get(ci - lc.n_core - lc.n_pillow).map_or_else(|| layer_index(bvh.closest(cd.centre[ci]).0, lc.delta, lc.nlayers.max(1), lc.growth), |&k| k as usize);
                     lrange = Some(lrange.map_or((k, k), |(a, b)| (a.min(k), b.max(k))));
                 }
             }
@@ -327,37 +328,37 @@ fn describe(cl: &mut Cluster, bvh: &Bvh, feats: &Features, g: &Geometry, lc: &Lo
     } else if is_thin {
         (
             "The body is much thinner than the layer stack here (typically a trailing edge or thin plate tip): layers from the two sides meet at the edge and the cells are squeezed or sheared.".into(),
-            format!("Reduce --delta (try {:.2e}) or use fewer layers; a sharp trailing edge always stays thinner than delta near its tip, so a small remainder is expected.", 0.5 * lc.delta),
+            "Known limitation at thin sharp edges (see the README): a few skewed cells at a sharp trailing edge are expected with the current version, and the automatic sizing is the most robust setting we have tested (a smaller --delta or finer --h-surf did not remove them on the ONERA M6). A slightly blunt trailing edge in CAD avoids them.".into(),
         )
     } else if convex && layer_dominant {
         (
             "Layer columns fan out around a sharp convex edge; cells at the edge are strongly sheared (large skewness / non-orthogonality) or invert when the wedge angle is very small.".into(),
-            "Reduce --delta or the number of layers, lower --growth, or round the edge in CAD; the shell resolution near the edge (--h-surf) also sets how well the fan is formed.".into(),
+            "Rounding the edge in CAD removes the fan. A smaller --delta, fewer layers or a lower --growth may help; they are not validated against this kind of defect.".into(),
         )
     } else if concave && layer_dominant {
         (
             "Layer columns from the two flanks converge in a concave crease and pinch; cells there are skewed or squeezed.".into(),
-            "Increase --fillet (shell fillet radius in units of delta) or reduce --delta; a refined --h-surf near the crease helps.".into(),
+            "A larger --fillet (shell fillet radius in units of delta) or a smaller --delta may help.".into(),
         )
     } else if is_curved {
         (
             "The radius of curvature here is below the surface cell size, so the shell and its cells cannot follow the surface (typical for a leading-edge nose).".into(),
-            format!("Use a finer --h-surf (about {:.1e} or below) or --preset fine.", rad / 1.5),
+            "Accept it if the nose is not critical, or round / resolve it in CAD. A finer --h-surf is not suggested: it has not been validated to remove the layer defects at an under-resolved nose.".to_string(),
         )
     } else if layer_dominant {
         (
             "No sharp feature or thin region was found nearby: the layer cells are likely distorted where the shell mesh changes (hanging / irregular shell vertices) or by the column smoothing.".into(),
-            "Try a slightly smaller --delta or --growth, or a finer --h-surf; if it persists on smooth geometry, please report the case.".into(),
+            "A slightly smaller --delta or --growth may help; if it persists on smooth geometry, please report the case.".into(),
         )
     } else if convex || concave {
         (
             "Pillow / core cells sit between the hex core and the offset shell; the shell is strongly curved or folded at this feature, so the projected pillow cells are stretched and skewed.".into(),
-            "Reduce --delta (the shell then follows the surface more closely) or use a finer --h-surf near the feature; round the edge in CAD if possible.".into(),
+            "A smaller --delta (the shell then follows the surface more closely) may help; rounding the edge in CAD is the reliable fix.".into(),
         )
     } else {
         (
             "Core / pillow cells at the shell: the projection of the core boundary onto the offset shell is locally irregular (strong size change or a fold of the shell).".into(),
-            "Try a finer --h-surf or a smaller --delta; if it persists on smooth geometry, please report the case.".into(),
+            "A smaller --delta may help; if it persists on smooth geometry, please report the case.".into(),
         )
     };
     cl.cause = cause;
@@ -581,8 +582,8 @@ fn cluster_md(i: usize, c: &Cluster) -> String {
     s += &format!("- extent: x {:.3e}..{:.3e}, y {:.3e}..{:.3e}, z {:.3e}..{:.3e}\n", c.lo[0], c.hi[0], c.lo[1], c.hi[1], c.lo[2], c.hi[2]);
     s += &format!("- failing checks: {}\n", c.checks.iter().map(|(n, k)| format!("{n} ({k})")).collect::<Vec<_>>().join(", "));
     s += &format!("- worst values: skewness {:.2}, non-orthogonality {:.1} deg, aspect {:.1}, min volume {:.2e}\n", c.max_skew, c.max_nonorth, c.max_aspect, c.min_vol);
-    let lay = c.layers.map_or(String::new(), |(a, b)| if a == b { format!(" (layer {a})") } else { format!(" (layers {a}..{b})") });
-    s += &format!("- stage: core {}, pillow {}, layer {}{}\n", c.n_core, c.n_pillow, c.n_layer + c.n_extra, lay);
+    let lay = c.layers.map_or(String::new(), |(a, b)| if a == b { format!(", in layer {a}") } else { format!(", in layers {a}-{b}") });
+    s += &format!("- cells by stage: {} core, {} pillow, {} boundary-layer{}\n", c.n_core, c.n_pillow, c.n_layer + c.n_extra, lay);
     s += &format!("- nearby geometry: {}\n- likely cause: {}\n- suggestion: {}\n\n", c.feature, c.cause, c.suggestion);
     s
 }

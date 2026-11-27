@@ -60,6 +60,8 @@ pub struct Curve {
     pub kind: Kind,
     /// corner ids at the two ends (`None`: closed loop)
     pub ends: Option<[usize; 2]>,
+    /// smallest deviation angle between the face normals (degrees) along the curve (180 for intersection curves)
+    pub angle_deg: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -107,6 +109,9 @@ pub struct CurveHit {
     pub p: V3,
     pub curve: usize,
     pub dist: f64,
+    /// segment of the curve polyline and parameter (0..1) of the hit on it
+    pub seg: usize,
+    pub u: f64,
 }
 
 pub struct Features {
@@ -122,6 +127,7 @@ pub struct Features {
 struct Piece {
     a: V3,
     b: V3,
+    ang: f64,
     convex: bool,
 }
 
@@ -312,7 +318,7 @@ impl Features {
                 let ok1 = on_boundary(add(m, mul(inward(c1), eps)), nrm[t1]);
                 let ok2 = ok1 && on_boundary(add(m, mul(inward(c2), eps)), nrm[t2]);
                 if ok1 && ok2 {
-                    pieces.push(Piece { a: add(pa, mul(e, w[0])), b: add(pa, mul(e, w[1])), convex });
+                    pieces.push(Piece { a: add(pa, mul(e, w[0])), b: add(pa, mul(e, w[1])), ang: dot(nrm[t1], nrm[t2]).clamp(-1.0, 1.0).acos().to_degrees(), convex });
                     st.sharp_pieces += 1;
                 }
             }
@@ -344,11 +350,11 @@ impl Features {
                 let ua = unit(sub(nb, mul(na, dot(nb, na))));
                 let ub = unit(sub(na, mul(nb, dot(na, nb))));
                 if on_boundary(add(m, mul(ua, eps)), na) && on_boundary(add(m, mul(ub, eps)), nb) {
-                    pieces.push(Piece { a: p, b: r, convex: false });
+                    pieces.push(Piece { a: p, b: r, ang: 180.0, convex: false });
                     st.isect_pieces += 1;
                 } else if norm(sub(r, p)) < 40.0 * eps {
                     // short segments at triangle corners: the offset sample can leave the triangles; decided below by their neighbours
-                    short.push(Piece { a: p, b: r, convex: false });
+                    short.push(Piece { a: p, b: r, ang: 180.0, convex: false });
                 }
             }
         }
@@ -402,10 +408,12 @@ impl Features {
         };
         // pieces as (node a, node b, convex)
         let mut pn: Vec<(u32, u32, bool)> = Vec::new();
+        let mut pang: Vec<f64> = Vec::new();
         for p in &pieces {
             let (a, b) = (weld(p.a, &mut nodes), weld(p.b, &mut nodes));
             if a != b {
                 pn.push((a, b, p.convex));
+                pang.push(p.ang);
             }
         }
         // T-junctions: free ends lying inside other pieces split them
@@ -436,6 +444,7 @@ impl Features {
                 let (a, b, cv) = pn[k];
                 pn[k] = (a, nidx as u32, cv);
                 pn.push((nidx as u32, b, cv));
+                pang.push(pang[k]);
                 st.t_splits += 1;
             }
         }
@@ -470,22 +479,24 @@ impl Features {
         }
         let mut used: Vec<bool> = vec![false; pn.len()];
         let mut curves: Vec<Curve> = Vec::new();
-        let walk = |start: usize, first: usize, used: &mut Vec<bool>| -> (Vec<V3>, usize, bool) {
+        let walk = |start: usize, first: usize, used: &mut Vec<bool>| -> (Vec<V3>, usize, bool, f64) {
             let mut pts = vec![nodes[start].0];
+            let mut amin = f64::INFINITY;
             let (mut cur, mut k) = (start, first);
             loop {
                 used[k] = true;
+                amin = amin.min(pang[k]);
                 let (a, b, cv) = pn[k];
                 let nxt = if a as usize == cur { b as usize } else { a as usize };
                 pts.push(nodes[nxt].0);
                 if is_corner[nxt] || nxt == start {
-                    return (pts, nxt, cv);
+                    return (pts, nxt, cv, amin);
                 }
                 cur = nxt;
                 let nk = inc[nxt].iter().map(|&x| x as usize).find(|&x| !used[x]);
                 match nk {
                     Some(x) => k = x,
-                    None => return (pts, nxt, cv),
+                    None => return (pts, nxt, cv, amin),
                 }
             }
         };
@@ -497,7 +508,7 @@ impl Features {
                 if used[k as usize] {
                     continue;
                 }
-                let (pts, end, cv) = walk(v, k as usize, &mut used);
+                let (pts, end, cv, amin) = walk(v, k as usize, &mut used);
                 let id = curves.len();
                 let (e0, e1) = (cid[v], cid[end]);
                 if e0 != usize::MAX {
@@ -508,7 +519,7 @@ impl Features {
                 } else if e1 == e0 && e0 != usize::MAX {
                     corners[e0].curves.push(id);
                 }
-                curves.push(Curve { pts, kind: if cv { Kind::Convex } else { Kind::Concave }, ends: if e0 != usize::MAX && e1 != usize::MAX { Some([e0, e1]) } else { None } });
+                curves.push(Curve { pts, kind: if cv { Kind::Convex } else { Kind::Concave }, ends: if e0 != usize::MAX && e1 != usize::MAX { Some([e0, e1]) } else { None }, angle_deg: amin });
             }
         }
         // closed loops without corners
@@ -517,8 +528,8 @@ impl Features {
                 continue;
             }
             if let Some(&k) = inc[v].iter().find(|&&k| !used[k as usize]) {
-                let (pts, _, cv) = walk(v, k as usize, &mut used);
-                curves.push(Curve { pts, kind: if cv { Kind::Convex } else { Kind::Concave }, ends: None });
+                let (pts, _, cv, amin) = walk(v, k as usize, &mut used);
+                curves.push(Curve { pts, kind: if cv { Kind::Convex } else { Kind::Concave }, ends: None, angle_deg: amin });
             }
         }
         st.curves = curves.len();
@@ -574,10 +585,10 @@ impl Features {
                         if let Some(l) = self.grid.get(&(x, y, z)) {
                             for &(ci, s) in l {
                                 let c = &self.curves[ci as usize];
-                                let (q, _) = closest_on_seg(p, c.pts[s as usize], c.pts[s as usize + 1]);
+                                let (q, u) = closest_on_seg(p, c.pts[s as usize], c.pts[s as usize + 1]);
                                 let d = norm(sub(q, p));
-                                if d <= max_dist && best.as_ref().is_none_or(|b| d < b.dist) {
-                                    best = Some(CurveHit { p: q, curve: ci as usize, dist: d });
+                                if d <= max_dist && best.as_ref().is_none_or(|b| d < b.dist || (d == b.dist && (ci as usize, s as usize) < (b.curve, b.seg))) {
+                                    best = Some(CurveHit { p: q, curve: ci as usize, dist: d, seg: s as usize, u });
                                 }
                             }
                         }

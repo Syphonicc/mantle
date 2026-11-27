@@ -77,6 +77,9 @@ pub struct LayerOptions {
     /// harmonic columns: a cluster of columns whose wall points coincide (a convex fan) is only merged into one wall node when its spokes (wall node -> shell vertex)
     /// span more than this angle (degrees); shallow facet edges of a coarse tessellation are treated as smooth (feet stay separate, streamline ends). 0 = always merge
     pub feature_angle: f64,
+    /// structured fans: the wall nodes of columns whose foot lies on a sharp convex feature curve come from a 1D discretisation of that curve
+    /// (see `edge_nodes`) instead of clustering feet by 3D proximity
+    pub edge_nodes: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -193,12 +196,18 @@ pub struct LayerStats {
     /// columns snapped onto a corner / onto a feature curve
     pub feat_corner_cols: usize,
     pub feat_curve_cols: usize,
+    /// structured fans: columns on a convex feature curve, distinct curve nodes they use, shell edges between two such columns whose nodes were
+    /// not consecutive after the construction (0 = every layer cell touches at most two consecutive edge nodes)
+    pub edge_cols: usize,
+    pub edge_node_count: usize,
+    pub edge_violations: usize,
+    pub edge_bad_patterns: usize,
     /// columns whose foot is the streamline end (continuous foot map)
     pub cont_cols: usize,
     /// terminated column pairs and the level they are zipped from
     pub zip_pairs: usize,
     pub zip_levels: Vec<usize>,
-    /// diagnostics: (wall foot of the first column, layer, scaled Jacobian) of up to 80 non-positive layer cells
+    /// diagnostics: (wall foot of the first column, layer, scaled Jacobian) of up to 4000 non-positive layer cells
     pub bad_cells: Vec<(V3, usize, f64)>,
     pub nonpositive_poly: usize,
     pub first_min: f64,
@@ -244,8 +253,8 @@ impl LayerStats {
         let fin = |x: f64| if x.is_finite() { x } else { f64::NAN };
         let (sj_min_hex, sj_min_prism, sj_min_pyramid) = (fin(self.sj_min_hex), fin(self.sj_min_prism), fin(self.sj_min_pyramid));
         format!(
-            "{{\"layers\": {}, \"dy0\": {:e}, \"growth\": {}, \"snap\": {}, \"repair_sj\": {}, \"repair_rounds\": {}, \"repair_merges\": {}, \"columns\": {}, \"layer_cells\": {{\"hex\": {}, \"prism\": {}, \"pyramid\": {}, \"poly\": {}}}, \"wall_faces\": {}, \"wall_tris\": {}, \"wall_nodes\": {}, \"merged_wall_nodes\": {}, \"shell_quads\": {}, \"degenerate_quads\": {}, \"layer_sj_min\": {:e}, \"layer_sj_min_by_type\": {{\"hex\": {:e}, \"prism\": {:e}, \"pyramid\": {:e}}}, \"n_layer_sj_below_0p1\": {}, \"n_layer_sj_below_0p2\": {}, \"n_layer_nonpositive\": {}, \"nonpositive_poly\": {}, \"first_cell_height\": {{\"min\": {:e}, \"median\": {:e}, \"max\": {:e}, \"max_rel_dev_from_dy0\": {:e}}}, \"columns_clamped\": {}, \"growth_used\": [{:.6}, {:.6}], \"column_height\": [{:e}, {:e}], \"stack_err_max\": {:e}, \"column_crossings\": {}, \"orient_mismatch\": {}, \"layer_nonmanifold\": {}, \"columns_mode\": \"{}\", \"n_cols\": {}, \"n_fallback_cols\": {}, \"n_curved_cols\": {}, \"n_straight_merged_cols\": {}, \"path_ratio_max\": {:.4}, \"first_dist\": {{\"min\": {:e}, \"median\": {:e}, \"max\": {:e}, \"merged_min\": {:e}, \"merged_max\": {:e}, \"n_off_10pct\": {}, \"n_off_10pct_merged\": {}}}, \"laplace\": {}, \"smooth_moves\": {}, \"bad_cells\": [{}], \"n_bad_pyr\": {}, \"pass0_nonpositive\": {}, \"prepolish_nonpositive\": {}, \"features\": {}, \"feat_corner_cols\": {}, \"feat_curve_cols\": {}, \"cont_cols\": {}, \"zip_pairs\": {}, \"zip_levels\": {:?}, \"t_layers\": {:.3}}}",
-            self.layers, self.dy0, self.growth, self.snap, self.repair_sj, self.repair_rounds, self.repair_merges, self.columns, self.hex, self.prism, self.pyramid, self.poly, self.wall_faces, self.wall_tris, self.wall_nodes, self.merged_wall_nodes, self.shell_quads, self.degenerate_quads, self.sj_min, sj_min_hex, sj_min_prism, sj_min_pyramid, self.n_below_0p1, self.n_below_0p2, self.n_nonpositive, self.nonpositive_poly, self.first_min, self.first_median, self.first_max, self.first_rel_dev_max, self.columns_clamped, self.growth_min, self.growth_max, self.height_min, self.height_max, self.stack_err_max, self.column_crossings, self.orient_mismatch, self.nonmanifold, if self.harmonic { "harmonic" } else { "nearest" }, self.columns, self.n_fallback_cols, self.n_curved_cols, self.n_straight_merged_cols, self.path_ratio_max, fin(self.first_dist_min), fin(self.first_dist_median), fin(self.first_dist_max), fin(self.first_dist_merged_min), fin(self.first_dist_merged_max), self.first_dist_off10, self.first_dist_off10_merged, self.laplace.as_ref().map_or("null".to_string(), |h| h.json()), self.smooth_moves, self.bad_cells.iter().map(|(w, k, sj)| format!("[{:.4}, {:.4}, {:.4}, {}, {:.3}]", w[0], w[1], w[2], k, sj)).collect::<Vec<_>>().join(", "), self.n_bad_pyr, self.pass0_nonpos, self.prepolish_nonpos, self.feat.json(), self.feat_corner_cols, self.feat_curve_cols, self.cont_cols, self.zip_pairs, self.zip_levels, self.t_layers
+            "{{\"layers\": {}, \"dy0\": {:e}, \"growth\": {}, \"snap\": {}, \"repair_sj\": {}, \"repair_rounds\": {}, \"repair_merges\": {}, \"columns\": {}, \"layer_cells\": {{\"hex\": {}, \"prism\": {}, \"pyramid\": {}, \"poly\": {}}}, \"wall_faces\": {}, \"wall_tris\": {}, \"wall_nodes\": {}, \"merged_wall_nodes\": {}, \"shell_quads\": {}, \"degenerate_quads\": {}, \"layer_sj_min\": {:e}, \"layer_sj_min_by_type\": {{\"hex\": {:e}, \"prism\": {:e}, \"pyramid\": {:e}}}, \"n_layer_sj_below_0p1\": {}, \"n_layer_sj_below_0p2\": {}, \"n_layer_nonpositive\": {}, \"nonpositive_poly\": {}, \"first_cell_height\": {{\"min\": {:e}, \"median\": {:e}, \"max\": {:e}, \"max_rel_dev_from_dy0\": {:e}}}, \"columns_clamped\": {}, \"growth_used\": [{:.6}, {:.6}], \"column_height\": [{:e}, {:e}], \"stack_err_max\": {:e}, \"column_crossings\": {}, \"orient_mismatch\": {}, \"layer_nonmanifold\": {}, \"columns_mode\": \"{}\", \"n_cols\": {}, \"n_fallback_cols\": {}, \"n_curved_cols\": {}, \"n_straight_merged_cols\": {}, \"path_ratio_max\": {:.4}, \"first_dist\": {{\"min\": {:e}, \"median\": {:e}, \"max\": {:e}, \"merged_min\": {:e}, \"merged_max\": {:e}, \"n_off_10pct\": {}, \"n_off_10pct_merged\": {}}}, \"laplace\": {}, \"smooth_moves\": {}, \"bad_cells\": [{}], \"n_bad_pyr\": {}, \"pass0_nonpositive\": {}, \"prepolish_nonpositive\": {}, \"features\": {}, \"feat_corner_cols\": {}, \"feat_curve_cols\": {}, \"edge_cols\": {}, \"edge_nodes\": {}, \"edge_violations\": {}, \"edge_bad_patterns\": {}, \"cont_cols\": {}, \"zip_pairs\": {}, \"zip_levels\": {:?}, \"t_layers\": {:.3}}}",
+            self.layers, self.dy0, self.growth, self.snap, self.repair_sj, self.repair_rounds, self.repair_merges, self.columns, self.hex, self.prism, self.pyramid, self.poly, self.wall_faces, self.wall_tris, self.wall_nodes, self.merged_wall_nodes, self.shell_quads, self.degenerate_quads, self.sj_min, sj_min_hex, sj_min_prism, sj_min_pyramid, self.n_below_0p1, self.n_below_0p2, self.n_nonpositive, self.nonpositive_poly, self.first_min, self.first_median, self.first_max, self.first_rel_dev_max, self.columns_clamped, self.growth_min, self.growth_max, self.height_min, self.height_max, self.stack_err_max, self.column_crossings, self.orient_mismatch, self.nonmanifold, if self.harmonic { "harmonic" } else { "nearest" }, self.columns, self.n_fallback_cols, self.n_curved_cols, self.n_straight_merged_cols, self.path_ratio_max, fin(self.first_dist_min), fin(self.first_dist_median), fin(self.first_dist_max), fin(self.first_dist_merged_min), fin(self.first_dist_merged_max), self.first_dist_off10, self.first_dist_off10_merged, self.laplace.as_ref().map_or("null".to_string(), |h| h.json()), self.smooth_moves, self.bad_cells.iter().map(|(w, k, sj)| format!("[{:.4}, {:.4}, {:.4}, {}, {:.3}]", w[0], w[1], w[2], k, sj)).collect::<Vec<_>>().join(", "), self.n_bad_pyr, self.pass0_nonpos, self.prepolish_nonpos, self.feat.json(), self.feat_corner_cols, self.feat_curve_cols, self.edge_cols, self.edge_node_count, self.edge_violations, self.edge_bad_patterns, self.cont_cols, self.zip_pairs, self.zip_levels, self.t_layers
         )
         .replace("NaN", "null")
     }
@@ -256,6 +265,8 @@ pub struct LayerMesh {
     pub stats: LayerStats,
     /// mesh point ids of the column nodes: `nodes[i * (layers + 1) + k]` for shell vertex `i`, level `k` (0 = wall node, `layers` = shell vertex)
     pub nodes: Vec<u32>,
+    /// layer index (1 = at the wall) of every layer cell, in the order of the layer cells in `mesh.cells` (after the core / pillow cells)
+    pub cell_layer: Vec<u8>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -969,7 +980,7 @@ pub fn build(hc: &HexCore, tris: &[Tri], opt: &LayerOptions) -> LayerMesh {
     } else {
         (Vec::new(), None)
     };
-    let feat = if opt.features { Features::detect(tris, &FeatureOptions::default()) } else { Features::empty() };
+    let feat = if opt.features || opt.edge_nodes { Features::detect(tris, &FeatureOptions { angle_deg: if opt.feature_angle > 0.0 { opt.feature_angle } else { FeatureOptions::default().angle_deg } }) } else { Features::empty() };
     let mut forced: Vec<(u32, u32)> = Vec::new();
     // columns switched from their streamline to the straight chord to their wall node (repair of cells next to straight merged columns)
     let mut fs: Vec<bool> = vec![false; hc.shell.pts.len()];
@@ -1186,6 +1197,415 @@ fn feature_snap(sh: &crate::hexcore::ShellQuads, cols: &mut [Col], feat: &Featur
     (snapped, blended, nc, nk)
 }
 
+/// Wall nodes of the columns that sit on sharp convex feature curves.
+struct EdgeNodes {
+    /// per column: id of its curve node (`NONE` = the foot is not on a convex feature curve)
+    id: Vec<u32>,
+    n_nodes: usize,
+    /// shell edges whose two columns use curve nodes that are not equal or consecutive
+    violations: usize,
+    /// quads of four edge columns whose nodes do not form a wedge (see `edge_nodes`)
+    bad_patterns: usize,
+}
+
+impl EdgeNodes {
+    fn none(nv: usize) -> EdgeNodes {
+        EdgeNodes { id: vec![NONE; nv], n_nodes: 0, violations: 0, bad_patterns: 0 }
+    }
+}
+
+/// Structured fans on sharp convex edges. The feet of the shell vertices around a convex edge lie on the edge itself, at positions along it that
+/// follow the (unaligned) projection of the shell vertices, so clustering them by 3D proximity gives jittering, irregular fans. Instead each
+/// convex feature curve is discretised once in 1D:
+///   * nodes sit on the curve polyline: both ends (the corners of the feature graph, shared by all curves meeting there) and the vertices
+///     that the polyline needs to stay within `0.1 dy0` of itself (Douglas-Peucker), between them at a regular arc-length spacing;
+///   * the spacing follows the projected spanwise size of the shell quads: the local largest arc-length difference between the feet of two
+///     shell-adjacent columns on the curve (a window of +-2 mean differences), so nodes are never closer than the local shell edges;
+///   * every column whose foot is on the curve (within 1e-3 dy0) takes the curve node nearest along arc length as its wall node;
+///   * where two shell-adjacent columns still end up on non-consecutive nodes (a locally larger shell edge), the nodes between them are
+///     dropped (the spacing coarsens there) until every layer cell touches at most two consecutive edge nodes.
+/// The columns of one node form a proper fan. Columns whose foot is not on a curve are untouched. `skip` columns are left alone.
+fn edge_nodes(sh: &crate::hexcore::ShellQuads, cols: &mut [Col], feat: &Features, dy0: f64, size: f64, skip: &[bool]) -> EdgeNodes {
+    let nv = sh.pts.len();
+    let mut en = EdgeNodes::none(nv);
+    if feat.curves.is_empty() {
+        return en;
+    }
+    let tol = (1e-3 * dy0).max(1e-9 * size);
+    let cums: Vec<Vec<f64>> = feat.curves.iter().map(|c| cum_len(&c.pts)).collect();
+    let mut hits: Vec<Option<(usize, f64)>> = par_map(&(0..nv).collect::<Vec<usize>>(), |&i| {
+        if skip[i] {
+            return None;
+        }
+        let h = feat.nearest_curve(cols[i].w, tol)?;
+        let c = &feat.curves[h.curve];
+        if c.kind != crate::features::Kind::Convex || c.pts.len() < 2 {
+            return None;
+        }
+        let cu = &cums[h.curve];
+        Some((h.curve, cu[h.seg] + h.u * (cu[h.seg + 1] - cu[h.seg])))
+    });
+    // unique shell edges
+    let mut edges: Vec<(u32, u32)> = Vec::new();
+    {
+        let mut seen: Map<(u32, u32), ()> = Map::default();
+        for q in &sh.quads {
+            for t in 0..4 {
+                let (a, b) = (q[t], q[(t + 1) % 4]);
+                if a != b && seen.insert((a.min(b), a.max(b)), ()).is_none() {
+                    edges.push((a.min(b), a.max(b)));
+                }
+            }
+        }
+    }
+    let nc = feat.curves.len();
+    // Resolution: a curve is only discretised when the normal cone of its edge subtends at least two shell edges on the shell, i.e. the arc
+    // (mean distance of its columns to the edge) x (deviation angle of its faces) >= 2 mean shell edge. A shallower edge (e.g. the faceted nose
+    // of a thin wing) is not resolved by the shell: it has no fan to structure and stays with the proximity clustering / repair.
+    let mut dcur = vec![0.0f64; nc];
+    let hmean = edges.iter().map(|&(a, b)| norm(sub(sh.pts[a as usize], sh.pts[b as usize]))).sum::<f64>() / edges.len().max(1) as f64;
+    {
+        let mut dsum = vec![(0.0f64, 0usize); nc];
+        for (i, h) in hits.iter().enumerate() {
+            if let Some((ci, _)) = h {
+                dsum[*ci].0 += norm(sub(sh.pts[i], cols[i].w));
+                dsum[*ci].1 += 1;
+            }
+        }
+        for ci in 0..nc {
+            dcur[ci] = dsum[ci].0 / dsum[ci].1.max(1) as f64;
+        }
+        let ok: Vec<bool> = (0..nc).map(|ci| dsum[ci].1 > 0 && dsum[ci].0 / dsum[ci].1 as f64 * feat.curves[ci].angle_deg.to_radians() >= 2.0 * hmean).collect();
+        for h in hits.iter_mut() {
+            if h.is_some_and(|(ci, _)| !ok[ci]) {
+                *h = None;
+            }
+        }
+    }
+    // arc-length differences of the feet of shell-adjacent columns on one curve: (midpoint, difference); a foot jump (feet much further
+    // apart than the shell edge is long) is not a spacing
+    let mut pairs: Vec<Vec<(f64, f64, f64)>> = vec![Vec::new(); nc];
+    let mut used = vec![false; nc];
+    let mut elen = vec![0.0f64; nc];
+    for &(a, b) in &edges {
+        let (ia, ib) = (a as usize, b as usize);
+        if let (Some((ca, sa)), Some((cb, sb))) = (hits[ia], hits[ib]) {
+            if ca == cb {
+                let (d, l) = ((sa - sb).abs(), norm(sub(sh.pts[ia], sh.pts[ib])));
+                elen[ca] = elen[ca].max(l);
+                if d <= 1.25 * l {
+                    pairs[ca].push((0.5 * (sa + sb), d, l));
+                }
+            }
+        }
+    }
+    for h in hits.iter().flatten() {
+        used[h.0] = true;
+    }
+    for p in pairs.iter_mut() {
+        p.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    }
+    // node bins per curve: (arc length, position, fixed); free bins end up at the mean arc position of their columns
+    let mut gid: Map<[i64; 3], u32> = Map::default();
+    let mut npos: Vec<V3> = Vec::new();
+    let q = (1e-9 * size).max(1e-300);
+    let mut key = |p: V3, npos: &mut Vec<V3>| -> u32 {
+        let k = [0, 1, 2].map(|d| (p[d] / q).round() as i64);
+        *gid.entry(k).or_insert_with(|| {
+            npos.push(p);
+            npos.len() as u32 - 1
+        })
+    };
+    let mut nodes: Vec<Vec<(f64, V3, bool)>> = vec![Vec::new(); nc];
+    let mut stspace = vec![0.0f64; nc];
+    for ci in 0..nc {
+        if !used[ci] {
+            continue;
+        }
+        let (c, cu) = (&feat.curves[ci], &cums[ci]);
+        let m = c.pts.len();
+        let total = cu[m - 1];
+        let pr = &pairs[ci];
+        // local spacing: the largest difference within +-win of x
+        let aligned: Vec<f64> = pr.iter().filter(|p| p.1 > 0.5 * p.2).map(|p| p.1).collect();
+        let dmean = (if aligned.is_empty() { elen[ci] } else { aligned.iter().sum::<f64>() / aligned.len() as f64 }).max(0.25 * hmean);
+        let win = 2.0 * dmean;
+        stspace[ci] = dmean;
+        let sp = |x: f64| -> f64 {
+            let i0 = pr.partition_point(|p| p.0 < x - win);
+            let i1 = pr.partition_point(|p| p.0 <= x + win);
+            let g = pr[i0..i1].iter().map(|p| p.1).fold(0.0f64, f64::max);
+            g.max(0.25 * hmean).max(if g > 0.0 { 0.0 } else { dmean })
+        };
+        // fixed nodes: Douglas-Peucker breakpoints of the polyline within 0.1 dy0
+        let mut keep = vec![false; m];
+        keep[0] = true;
+        keep[m - 1] = true;
+        let mut stack = vec![(0usize, m - 1)];
+        while let Some((i0, i1)) = stack.pop() {
+            let (a, b) = (c.pts[i0], c.pts[i1]);
+            let ab = sub(b, a);
+            let l2 = dot(ab, ab).max(1e-300);
+            let (mut worst, mut wi) = (0.0f64, 0usize);
+            for j in i0 + 1..i1 {
+                let t = (dot(sub(c.pts[j], a), ab) / l2).clamp(0.0, 1.0);
+                let d = norm(sub(c.pts[j], [a[0] + ab[0] * t, a[1] + ab[1] * t, a[2] + ab[2] * t]));
+                if d > worst {
+                    worst = d;
+                    wi = j;
+                }
+            }
+            if worst > 0.1 * dy0 {
+                keep[wi] = true;
+                stack.push((i0, wi));
+                stack.push((wi, i1));
+            }
+        }
+        let bp: Vec<usize> = (0..m).filter(|&j| keep[j]).collect();
+        let end_pos = |side: usize, fallback: V3| -> V3 {
+            match c.ends {
+                Some(e) if e[side] < feat.corners.len() => feat.corners[e[side]].p,
+                _ => fallback,
+            }
+        };
+        let nl = &mut nodes[ci];
+        for w in bp.windows(2) {
+            let (j0, j1) = (w[0], w[1]);
+            let (a, b) = (c.pts[j0], c.pts[j1]);
+            let len = cu[j1] - cu[j0];
+            // march with the local spacing; a last gap shorter than half a spacing is absorbed by the previous node
+            let mut ss: Vec<f64> = vec![0.0];
+            loop {
+                let cur = *ss.last().unwrap();
+                let g0 = sp(cu[j0] + cur);
+                let g = sp(cu[j0] + cur + 0.5 * g0).max(g0).max(0.25 * hmean).max(1e-12 * size);
+                if cur + 1.5 * g > len {
+                    break;
+                }
+                ss.push(cur + g);
+            }
+            for (k, &sa) in ss.iter().enumerate() {
+                let p = if k == 0 {
+                    if j0 == 0 { end_pos(0, a) } else { a }
+                } else {
+                    let f = sa / len;
+                    [0, 1, 2].map(|d| a[d] + (b[d] - a[d]) * f)
+                };
+                nl.push((cu[j0] + sa, p, k == 0));
+            }
+        }
+        nl.push((total, end_pos(1, c.pts[m - 1]), true));
+    }
+    // assignment: nearest node along arc length (ties: lower); then drop the nodes between non-consecutive columns until none is left
+    let assign = |hs: &Vec<Option<(usize, f64)>>, nodes: &Vec<Vec<(f64, V3, bool)>>| -> Vec<Option<usize>> {
+        hs.iter()
+            .map(|h| {
+                let (ci, s) = (*h)?;
+                let nl = &nodes[ci];
+                let k = nl.partition_point(|n| n.0 < s);
+                Some(if k == 0 {
+                    0
+                } else if k == nl.len() {
+                    nl.len() - 1
+                } else if s - nl[k - 1].0 <= nl[k].0 - s {
+                    k - 1
+                } else {
+                    k
+                })
+            })
+            .collect()
+    };
+    // Stations. Columns of a fan that are linked by shell edges running mostly across the curve (|arc difference| < half the edge length) form one
+    // station (a row of the shell transverse to the edge); the station is binned at its mean arc position, so a transverse row of the shell goes
+    // to one node and the node boundaries cut the shell along edges that run along the curve (a regular fan: quads of two nodes in two adjacent
+    // pairs). Binning every column by its own arc position cuts rows that are not aligned with the curve in staircases (quads with one odd corner).
+    let orig_hits = hits.clone();
+    {
+        let mut par: Vec<usize> = (0..nv).collect();
+        fn fnd(p: &mut [usize], mut x: usize) -> usize {
+            while p[x] != x {
+                p[x] = p[p[x]];
+                x = p[x];
+            }
+            x
+        }
+        let mut lo: Vec<f64> = hits.iter().map(|h| h.map_or(0.0, |x| x.1)).collect();
+        let mut hi = lo.clone();
+        let mut ord: Vec<(f64, usize)> = Vec::new();
+        for (k, &(a, b)) in edges.iter().enumerate() {
+            let (ia, ib) = (a as usize, b as usize);
+            if let (Some((ca, sa)), Some((cb, sb))) = (hits[ia], hits[ib]) {
+                if ca == cb {
+                    let dt = (sa - sb).abs();
+                    if dt < 0.5 * stspace[ca] {
+                        ord.push((dt, k));
+                    }
+                }
+            }
+        }
+        ord.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        // extent cap: a station spans at most twice the local spacing
+        for &(_, k) in &ord {
+            let (a, b) = (edges[k].0 as usize, edges[k].1 as usize);
+            let (ra, rb) = (fnd(&mut par, a), fnd(&mut par, b));
+            if ra == rb {
+                continue;
+            }
+            let ci = hits[a].unwrap().0;
+            let cap = 0.7 * dcur[ci];
+            let (nl, nh) = (lo[ra].min(lo[rb]), hi[ra].max(hi[rb]));
+            if nh - nl <= cap {
+                par[rb.max(ra)] = ra.min(rb);
+                let r = ra.min(rb);
+                lo[r] = nl;
+                hi[r] = nh;
+            }
+        }
+        let mut sum: Map<usize, (f64, usize)> = Map::default();
+        for i in 0..nv {
+            if let Some((_, s)) = hits[i] {
+                let e = sum.entry(fnd(&mut par, i)).or_insert((0.0, 0));
+                e.0 += s;
+                e.1 += 1;
+            }
+        }
+        for i in 0..nv {
+            if let Some((ci, _)) = hits[i] {
+                let (sm, c) = sum[&fnd(&mut par, i)];
+                hits[i] = Some((ci, sm / c as f64));
+            }
+        }
+    }
+    let mut idx = assign(&hits, &nodes);
+    for _ in 0..40 {
+        let mut drop: Vec<(usize, usize)> = Vec::new();
+        for &(a, b) in &edges {
+            let (ia, ib) = (a as usize, b as usize);
+            if let (Some((ca, sa)), Some((cb, sb)), Some(na), Some(nb)) = (orig_hits[ia], orig_hits[ib], idx[ia], idx[ib]) {
+                if ca == cb && na.abs_diff(nb) > 1 && (sa - sb).abs() <= 1.25 * norm(sub(sh.pts[ia], sh.pts[ib])) {
+                    for k in na.min(nb) + 1..na.max(nb) {
+                        drop.push((ca, k));
+                    }
+                }
+            }
+        }
+        drop.retain(|&(ci, k)| !nodes[ci][k].2);
+        if drop.is_empty() {
+            break;
+        }
+        drop.sort_unstable();
+        drop.dedup();
+        for &(ci, k) in drop.iter().rev() {
+            nodes[ci].remove(k);
+        }
+        idx = assign(&hits, &nodes);
+    }
+    // Fan validity. The columns of a quad that all sit on the edge collapse onto the edge; the cell is only valid when the node boundaries cross the
+    // quad along its edges that run along the curve (a a b b), and the within-node edges are not parallel to the curve (a node boundary cutting a quad
+    // at one corner, a a a b, has a flat corner at the wall). Binning by arc length cuts unaligned rows of the shell in staircases that violate this,
+    // so each column may move to a neighbouring node (equal or consecutive to all its edge neighbours) where that makes the near-wall cells
+    // (homothetic spokes at 5 % / 12 % of the stack, scaled Jacobian) better; sweeps until nothing moves.
+    {
+        let mut qinc: Map<usize, Vec<[usize; 4]>> = Map::default();
+        for q in &sh.quads {
+            let v = [q[0] as usize, q[1] as usize, q[2] as usize, q[3] as usize];
+            for &i in &v {
+                if hits[i].is_some() {
+                    qinc.entry(i).or_default().push(v);
+                }
+            }
+        }
+        let mut nb: Map<usize, Vec<usize>> = Map::default();
+        for &(a, b) in &edges {
+            if hits[a as usize].is_some() && hits[b as usize].is_some() {
+                nb.entry(a as usize).or_default().push(b as usize);
+                nb.entry(b as usize).or_default().push(a as usize);
+            }
+        }
+        let quad_cost = |v: &[usize; 4], idx: &[Option<usize>], over: (usize, usize)| -> f64 {
+            // columns on the edge sit at their node, the others at their own foot
+            let node = |i: usize| -> V3 {
+                match (hits[i], idx[i]) {
+                    (Some((c, _)), Some(k)) => nodes[c][if i == over.0 { over.1 } else { k }].1,
+                    _ => cols[i].w,
+                }
+            };
+            let n: [V3; 4] = std::array::from_fn(|t| node(v[t]));
+            let t5: [V3; 4] = std::array::from_fn(|t| [0, 1, 2].map(|d| n[t][d] + 0.05 * (sh.pts[v[t]][d] - n[t][d])));
+            let t12: [V3; 4] = std::array::from_fn(|t| [0, 1, 2].map(|d| n[t][d] + 0.12 * (sh.pts[v[t]][d] - n[t][d])));
+            let p: [V3; 8] = [t5[0], t5[1], t5[2], t5[3], t12[0], t12[1], t12[2], t12[3]];
+            let sj = crate::hexcore::hex_sj_min(&p);
+            if sj.is_nan() { 1.0 } else { (0.3 - sj).max(0.0) }
+        };
+        let mut order: Vec<usize> = qinc.keys().cloned().collect();
+        order.sort_unstable();
+        for _ in 0..30 {
+            let mut moved = 0;
+            for &i in &order {
+                let (ci, ti) = orig_hits[i].unwrap();
+                let l0 = idx[i].unwrap();
+                let nl = &nodes[ci];
+                let mut best = (f64::INFINITY, l0);
+                for cand in [l0, l0.wrapping_sub(1), l0 + 1] {
+                    if cand >= nl.len() {
+                        continue;
+                    }
+                    if nb.get(&i).is_some_and(|l| l.iter().any(|&j| idx[j].unwrap().abs_diff(cand) > 1)) {
+                        continue;
+                    }
+                    let dev = (nl[cand].0 - ti).abs() / stspace[ci].max(1e-300);
+                    let c: f64 = qinc[&i].iter().map(|v| quad_cost(v, &idx, (i, cand))).sum::<f64>() + 0.02 * dev;
+                    if c < best.0 - 1e-12 {
+                        best = (c, cand);
+                    }
+                }
+                if best.1 != l0 {
+                    idx[i] = Some(best.1);
+                    moved += 1;
+                }
+            }
+            if moved == 0 {
+                break;
+            }
+        }
+        en.bad_patterns = qinc.values().flatten().collect::<std::collections::BTreeSet<_>>().iter().filter(|v| quad_cost(v, &idx, (usize::MAX, 0)) > 0.0).count();
+    }
+    // final nodes: pinned bins (curve ends, polyline breakpoints) stay, free bins sit at the mean arc position of their columns
+    let mut sums: Map<(usize, usize), (f64, usize)> = Map::default();
+    for i in 0..nv {
+        if let (Some((ci, s)), Some(k)) = (orig_hits[i], idx[i]) {
+            let e = sums.entry((ci, k)).or_insert((0.0, 0));
+            e.0 += s;
+            e.1 += 1;
+        }
+    }
+    let mut final_id: Map<(usize, usize), u32> = Map::default();
+    let mut keys: Vec<(usize, usize)> = sums.keys().cloned().collect();
+    keys.sort_unstable();
+    for (ci, k) in keys {
+        let (sm, cnt) = sums[&(ci, k)];
+        let nd = nodes[ci][k];
+        let p = if nd.2 { nd.1 } else { point_at(&feat.curves[ci].pts, &cums[ci], sm / cnt as f64) };
+        final_id.insert((ci, k), key(p, &mut npos));
+    }
+    for i in 0..nv {
+        let (Some((ci, _)), Some(k)) = (hits[i], idx[i]) else { continue };
+        let id = final_id[&(ci, k)];
+        en.id[i] = id;
+        cols[i].w = npos[id as usize];
+    }
+    en.n_nodes = en.id.iter().filter(|&&e| e != NONE).collect::<std::collections::BTreeSet<_>>().len();
+    for &(a, b) in &edges {
+        let (ia, ib) = (a as usize, b as usize);
+        if let (Some((ca, sa)), Some((cb, sb)), Some(na), Some(nb)) = (orig_hits[ia], orig_hits[ib], idx[ia], idx[ib]) {
+            if ca == cb && na.abs_diff(nb) > 1 && (sa - sb).abs() <= 1.25 * norm(sub(sh.pts[ia], sh.pts[ib])) {
+                en.violations += 1;
+            }
+        }
+    }
+    en
+}
+
 /// Continuous foot map. The nearest-point feet of neighbouring shell vertices jump (up to ~16 shell edges) across the medial axis of the wall, the
 /// feet of the harmonic streamlines do not (the field is smooth). Near such seams (collision quads: an edge whose nearest feet are more than
 /// `JUMP` edge lengths apart, plus `cont_rings` rings of shell edges; everywhere for `cont = 2`) the wall foot of a column is the end of its
@@ -1296,19 +1716,30 @@ fn build_pass(hc: &HexCore, bvh: &Bvh, opt: &LayerOptions, forced: &[(u32, u32)]
     let mut cols = cols;
     let own_foot = continuous_feet(sh, &mut cols, traces, feat, opt);
     st.cont_cols = own_foot.iter().filter(|&&b| b).count();
-    let (snapped, blended, n_corner, n_curve) = if opt.cont > 0 { (vec![false; nv], vec![false; nv], 0, 0) } else { feature_snap(sh, &mut cols, feat, bvh) };
-    let fixed: Vec<bool> = (0..nv).map(|i| snapped[i] || blended[i]).collect();
-    st.feat_corner_cols = n_corner;
-    st.feat_curve_cols = n_curve;
+    let (snapped, blended, n_corner, n_curve) = if opt.cont > 0 || !opt.features { (vec![false; nv], vec![false; nv], 0, 0) } else { feature_snap(sh, &mut cols, feat, bvh) };
     // size scale for tolerances
-    let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
-    for p in &sh.pts {
+    let mut size = 0.0f64;
+    {
+        let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        for p in &sh.pts {
+            for d in 0..3 {
+                lo[d] = lo[d].min(p[d]);
+                hi[d] = hi[d].max(p[d]);
+            }
+        }
         for d in 0..3 {
-            lo[d] = lo[d].min(p[d]);
-            hi[d] = hi[d].max(p[d]);
+            size = size.max(hi[d] - lo[d]);
         }
     }
-    let size = (0..3).map(|d| hi[d] - lo[d]).fold(0.0f64, f64::max);
+    let en = if opt.edge_nodes && opt.cont == 0 { edge_nodes(sh, &mut cols, feat, opt.dy0, size, &snapped) } else { EdgeNodes::none(nv) };
+    let eid = &en.id;
+    st.edge_cols = eid.iter().filter(|&&e| e != NONE).count();
+    st.edge_node_count = en.n_nodes;
+    st.edge_violations = en.violations;
+    st.edge_bad_patterns = en.bad_patterns;
+    let fixed: Vec<bool> = (0..nv).map(|i| snapped[i] || blended[i] || eid[i] != NONE).collect();
+    st.feat_corner_cols = n_corner;
+    st.feat_curve_cols = n_curve;
     let tol = 1e-9 * size;
     // Wall-node merging. Columns joined by a shell edge (a, b) share a wall node when their wall points are closer than
     // max(1e-9 size, snap * |v_a - v_b|): on a convex edge / corner the nearest points of a whole fan coincide (up to the noise left by
@@ -1322,6 +1753,18 @@ fn build_pass(hc: &HexCore, bvh: &Bvh, opt: &LayerOptions, forced: &[(u32, u32)]
         }
         x
     }
+    // clusters carry the edge node of their members (NONE: free): two different edge nodes are never merged
+    let mut rid: Vec<u32> = eid.clone();
+    fn unite(p: &mut [u32], rid: &mut [u32], a: u32, b: u32, strict: bool) {
+        let (ra, rb) = (find(p, a), find(p, b));
+        if ra == rb || (strict && rid[ra as usize] != NONE && rid[rb as usize] != NONE && rid[ra as usize] != rid[rb as usize]) {
+            return;
+        }
+        let e = if rid[ra as usize] != NONE { rid[ra as usize] } else { rid[rb as usize] };
+        let (lo, hi) = (ra.min(rb), ra.max(rb));
+        p[hi as usize] = lo;
+        rid[lo as usize] = e;
+    }
     {
         let mut seen: Map<(u32, u32), ()> = Map::default();
         for q in &sh.quads {
@@ -1332,20 +1775,18 @@ fn build_pass(hc: &HexCore, bvh: &Bvh, opt: &LayerOptions, forced: &[(u32, u32)]
                 }
                 let (pa, pb) = (a as usize, b as usize);
                 let lim = tol.max(opt.snap * norm(sub(sh.pts[pa], sh.pts[pb])));
+                // fans on a feature curve are exactly the columns of one edge node: no proximity merging with other columns
+                if (eid[pa] != NONE || eid[pb] != NONE) && eid[pa] != eid[pb] {
+                    continue;
+                }
                 if norm(sub(cols[pa].w, cols[pb].w)) <= lim {
-                    let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
-                    if ra != rb {
-                        parent[ra.max(rb) as usize] = ra.min(rb);
-                    }
+                    unite(&mut parent, &mut rid, a, b, true);
                 }
             }
         }
     }
     for &(a, b) in forced {
-        let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
-        if ra != rb {
-            parent[ra.max(rb) as usize] = ra.min(rb);
-        }
+        unite(&mut parent, &mut rid, a, b, false);
     }
     // exactly coincident wall points of columns that are not shell neighbours (e.g. a corner reached from two sides): sort sweep
     {
@@ -1359,10 +1800,7 @@ fn build_pass(hc: &HexCore, bvh: &Bvh, opt: &LayerOptions, forced: &[(u32, u32)]
                     break;
                 }
                 if norm(sub(cols[a].w, cols[b].w)) <= tol {
-                    let (ra, rb) = (find(&mut parent, a as u32), find(&mut parent, b as u32));
-                    if ra != rb {
-                        parent[ra.max(rb) as usize] = ra.min(rb);
-                    }
+                    unite(&mut parent, &mut rid, a as u32, b as u32, true);
                 }
             }
         }
@@ -1416,6 +1854,9 @@ fn build_pass(hc: &HexCore, bvh: &Bvh, opt: &LayerOptions, forced: &[(u32, u32)]
         if m.len() == 1 {
             let t = traces.get(m[0] as usize).filter(|t| t.code == 0 && !fixed[m[0] as usize] && !own_foot[m[0] as usize]);
             wnodes.push(t.map_or(cols[m[0] as usize].w, |t| *t.path.last().unwrap()));
+        } else if let Some(&i) = m.iter().find(|&&i| eid[i as usize] != NONE) {
+            // a fan on a feature curve: the node of the curve discretisation
+            wnodes.push(cols[i as usize].w);
         } else if let Some(&i) = m.iter().find(|&&i| snapped[i as usize]) {
             // a node of snapped columns sits exactly on the feature point
             wnodes.push(cols[i as usize].w);
@@ -1452,7 +1893,6 @@ fn build_pass(hc: &HexCore, bvh: &Bvh, opt: &LayerOptions, forced: &[(u32, u32)]
     st.wall_nodes = wnodes.len();
     st.merged_wall_nodes = nv - wnodes.len();
 
-    // column heights and node coordinates
     let np0 = base.points.len() as u32;
     let nw = wnodes.len() as u32;
     let mut pts: Vec<V3> = base.points.clone();
@@ -1672,6 +2112,7 @@ fn build_pass(hc: &HexCore, bvh: &Bvh, opt: &LayerOptions, forced: &[(u32, u32)]
     let mut cells: Vec<Cell> = base.cells.clone();
     let mut native: Map<u32, (u8, [u32; 8])> = Map::default();
     let mut kinds: Vec<Kind> = Vec::with_capacity(nq * n);
+    let mut cell_layer: Vec<u8> = Vec::with_capacity(nq * n);
     let (mut sjm, mut sjh, mut sjp, mut sjy) = (f64::INFINITY, f64::INFINITY, f64::INFINITY, f64::INFINITY);
     for (qi, q) in sh.quads.iter().enumerate() {
         let qv = [q[0] as usize, q[1] as usize, q[2] as usize, q[3] as usize];
@@ -1756,6 +2197,7 @@ fn build_pass(hc: &HexCore, bvh: &Bvh, opt: &LayerOptions, forced: &[(u32, u32)]
                 }
             };
             kinds.push(kind);
+            cell_layer.push((k + 1) as u8);
             // OpenFOAM face-pyramid check, with a margin (checkMesh decides on volumes of order 1e-15 where rounding of the written points matters)
             if (sj.is_nan() || sj < 0.3) && foam_pyramid_score(&pts, l, u) < PYR_MIN {
                 st.n_bad_pyr += 1;
@@ -1775,7 +2217,7 @@ fn build_pass(hc: &HexCore, bvh: &Bvh, opt: &LayerOptions, forced: &[(u32, u32)]
                 st.n_below_0p1 += (sj < 0.1) as usize;
                 st.n_below_0p2 += (sj < 0.2) as usize;
                 st.n_nonpositive += (sj <= 0.0) as usize;
-                if sj <= 0.0 && st.bad_cells.len() < 80 {
+                if sj <= 0.0 && st.bad_cells.len() < 4000 {
                     st.bad_cells.push((cols[qv[0]].w, k, sj));
                 }
             }
@@ -1783,7 +2225,6 @@ fn build_pass(hc: &HexCore, bvh: &Bvh, opt: &LayerOptions, forced: &[(u32, u32)]
             cells.push(Cell { faces: fl, hex, h: (norm(h) / n as f64).max(1e-300), cut: false, n_orig: 1 });
         }
     }
-    st.sj_min_hex = sjh;
     st.sj_min_prism = sjp;
     st.sj_min_pyramid = sjy;
     st.orient_mismatch = fb.mismatch;
@@ -1835,7 +2276,7 @@ fn build_pass(hc: &HexCore, bvh: &Bvh, opt: &LayerOptions, forced: &[(u32, u32)]
     let nodes: Vec<u32> = (0..nv).flat_map(|i| (0..=n).map(move |k| (i, k))).map(|(i, k)| node(i, k)).collect();
     bad_cols.sort_unstable();
     bad_cols.dedup();
-    (LayerMesh { mesh, stats: st, nodes }, bad_pairs, bad_cols)
+    (LayerMesh { mesh, stats: st, nodes, cell_layer }, bad_pairs, bad_cols)
 }
 
 /// Smallest accepted `foam_pyramid_score` of a layer cell.
@@ -2444,7 +2885,7 @@ mod tests {
         let (hc, delta) = core(&tris, -1.5, 3.2, 6);
         let (nl, r) = (8usize, 1.2);
         let dy0 = fit_dy0(delta, nl, r);
-        let lm = build(&hc, &tris, &LayerOptions { features: false, cont: 0, cont_rings: 3, zip: false, n: nl, dy0, growth: r, snap: 0.4, repair_sj: 0.05, columns: Columns::Nearest, smooth_sweeps: 0, hg_k: 8.0, feature_angle: 0.0 });
+        let lm = build(&hc, &tris, &LayerOptions { features: false, cont: 0, cont_rings: 3, zip: false, n: nl, dy0, growth: r, snap: 0.4, repair_sj: 0.05, columns: Columns::Nearest, smooth_sweeps: 0, hg_k: 8.0, feature_angle: 0.0, edge_nodes: false });
         let (s, m) = (&lm.stats, &lm.mesh);
         println!("layers: {}", s.json());
         assert_eq!(s.n_nonpositive, 0);
@@ -2505,12 +2946,29 @@ mod tests {
     }
 
     #[test]
+    fn cube_layers_edge_nodes() {
+        let tris = cube(-0.5, 0.5);
+        let (hc, delta) = core(&tris, -1.0, 2.0, 5);
+        let (nl, r) = (6usize, 1.2);
+        let dy0 = fit_dy0(delta, nl, r);
+        let lm = build(&hc, &tris, &LayerOptions { features: false, cont: 0, cont_rings: 3, zip: false, n: nl, dy0, growth: r, snap: 0.4, repair_sj: 0.05, columns: Columns::Harmonic, smooth_sweeps: 25, hg_k: 8.0, feature_angle: 25.0, edge_nodes: true });
+        let (s, m) = (&lm.stats, &lm.mesh);
+        assert!(s.edge_cols > 0 && s.edge_node_count > 0, "no columns on the cube edges");
+        assert_eq!(s.edge_violations, 0, "non-consecutive edge nodes");
+        assert_eq!(s.n_nonpositive, 0, "invalid layer cells");
+        assert_eq!((s.orient_mismatch, s.nonmanifold), (0, 0));
+        assert_eq!(lm.cell_layer.len(), m.cells.len() - hc.mesh.cells.len());
+        assert!(lm.cell_layer.iter().all(|&k| (1..=nl as u8).contains(&k)));
+        check_closed(m);
+    }
+
+    #[test]
     fn cube_layers() {
         let tris = cube(-0.5, 0.5);
         let (hc, delta) = core(&tris, -1.0, 2.0, 5);
         let (nl, r) = (6usize, 1.2);
         let dy0 = fit_dy0(delta, nl, r);
-        let lm = build(&hc, &tris, &LayerOptions { features: false, cont: 0, cont_rings: 3, zip: false, n: nl, dy0, growth: r, snap: 0.4, repair_sj: 0.05, columns: Columns::Nearest, smooth_sweeps: 0, hg_k: 8.0, feature_angle: 0.0 });
+        let lm = build(&hc, &tris, &LayerOptions { features: false, cont: 0, cont_rings: 3, zip: false, n: nl, dy0, growth: r, snap: 0.4, repair_sj: 0.05, columns: Columns::Nearest, smooth_sweeps: 0, hg_k: 8.0, feature_angle: 0.0, edge_nodes: false });
         let (s, m) = (&lm.stats, &lm.mesh);
         println!("layers cube: {}", s.json());
         assert!(s.prism > 0 && s.pyramid > 0, "no wedges / pyramids at the cube edges / corners");
@@ -2654,7 +3112,7 @@ mod tests {
         let (hc, _) = core(&tris, -1.0, 2.0, 6);
         let (nl, r) = (8usize, 1.25);
         let dy0 = fit_dy0(4.0 * 2.0 / 64.0, nl, r);
-        let lm = build(&hc, &tris, &LayerOptions { features: true, cont: 0, cont_rings: 3, zip: false, n: nl, dy0, growth: r, snap: 0.4, repair_sj: 0.05, columns: Columns::Harmonic, smooth_sweeps: 25, hg_k: 8.0, feature_angle: 0.0 });
+        let lm = build(&hc, &tris, &LayerOptions { features: true, cont: 0, cont_rings: 3, zip: false, n: nl, dy0, growth: r, snap: 0.4, repair_sj: 0.05, columns: Columns::Harmonic, smooth_sweeps: 25, hg_k: 8.0, feature_angle: 0.0, edge_nodes: false });
         let s = &lm.stats;
         println!("cross features: {}", s.json());
         assert_eq!(s.feat.mixed_corners, 8);
@@ -2667,7 +3125,7 @@ mod tests {
         let (hc, delta) = core(tris, org, size, l);
         let r = 1.25;
         let dy0 = fit_dy0(delta, nl, r);
-        let lm = build(&hc, tris, &LayerOptions { features: false, cont: 0, cont_rings: 3, zip: false, n: nl, dy0, growth: r, snap: 0.4, repair_sj: 0.05, columns: Columns::Harmonic, smooth_sweeps: 25, hg_k: 8.0, feature_angle: 0.0 });
+        let lm = build(&hc, tris, &LayerOptions { features: false, cont: 0, cont_rings: 3, zip: false, n: nl, dy0, growth: r, snap: 0.4, repair_sj: 0.05, columns: Columns::Harmonic, smooth_sweeps: 25, hg_k: 8.0, feature_angle: 0.0, edge_nodes: false });
         (lm, hc, dy0)
     }
 
@@ -2698,7 +3156,7 @@ mod tests {
         let (nl, r) = (8usize, 1.25);
         let delta = 4.0 * 2.0 / 64.0;
         let dy0 = fit_dy0(delta, nl, r);
-        let mk = |c| build(&hc, &tris, &LayerOptions { features: false, cont: 0, cont_rings: 3, zip: false, n: nl, dy0, growth: r, snap: 0.4, repair_sj: 0.05, columns: c, smooth_sweeps: if c == Columns::Harmonic { 25 } else { 0 }, hg_k: 8.0, feature_angle: 0.0 });
+        let mk = |c| build(&hc, &tris, &LayerOptions { features: false, cont: 0, cont_rings: 3, zip: false, n: nl, dy0, growth: r, snap: 0.4, repair_sj: 0.05, columns: c, smooth_sweeps: if c == Columns::Harmonic { 25 } else { 0 }, hg_k: 8.0, feature_angle: 0.0, edge_nodes: false });
         let (hm, nr) = (mk(Columns::Harmonic), mk(Columns::Nearest));
         println!("cross nearest : {}", nr.stats.json());
         println!("cross harmonic: {}", hm.stats.json());
